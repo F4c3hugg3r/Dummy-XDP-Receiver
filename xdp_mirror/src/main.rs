@@ -77,5 +77,25 @@ async fn main() -> anyhow::Result<()> {
     ctrl_c.await?;
     println!("Exiting...");
 
+    let stats_map: aya::maps::PerCpuArray<_, xdp_mirror_common::Stats> =
+        aya::maps::PerCpuArray::try_from(ebpf.map("STATS").unwrap())?;
+
+    let stats = stats_map.get(&0, 0)?;
+    let mut total_rx = 0;
+    let mut total_valid_syn = 0;
+    let mut total_tx = 0;
+
+    for cpu_stats in stats.iter() {
+        total_rx += cpu_stats.rx;
+        total_valid_syn += cpu_stats.valid_syn;
+        total_tx += cpu_stats.tx;
+    }
+
+    println!("=========================");
+    println!("Total Packets Received: {}", total_rx);
+    println!("Valid SYN Packets:      {}", total_valid_syn);
+    println!("SYN-ACKs Sent:          {}", total_tx);
+    println!("=========================");
+
     Ok(())
 }

@@ -5,14 +5,18 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_get_prandom_u32, bpf_xdp_adjust_tail},
     macros::{map, xdp},
-    maps::Array,
+    maps::{Array, PerCpuArray},
     programs::XdpContext,
 };
+use aya_log_ebpf::info;
 use core::mem;
-use xdp_mirror_common::Config;
+use xdp_mirror_common::{Config, Stats};
 
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+
+#[map]
+static STATS: PerCpuArray<Stats> = PerCpuArray::with_max_entries(1, 0);
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -78,6 +82,10 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, u32> {
 }
 
 fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).rx += 1 };
+    }
+
     let eth_hdr: *const EthHdr = ptr_at(&ctx, 0)?;
     if unsafe { (*eth_hdr).ether_type } != u16::from_be(ETH_P_IP) {
         return Ok(xdp_action::XDP_DROP);
@@ -94,6 +102,10 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
 
     if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
         return Ok(xdp_action::XDP_DROP);
+    }
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).valid_syn += 1 };
     }
 
     if let Some(config) = CONFIG.get(0) {
@@ -152,6 +164,12 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
         (*tcp_hdr).check = tcp_csum(ipv4_hdr, tcp_hdr);
     }
 
+    info!(&ctx, "sent SYN-ACK");
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).tx += 1 };
+    }
+
     Ok(xdp_action::XDP_TX)
 }
 
@@ -192,11 +210,11 @@ unsafe fn tcp_csum(ip_hdr: *mut Ipv4Hdr, tcp_hdr: *mut TcpHdr) -> u16 {
     !sum as u16
 }
 
-// #[cfg(not(test))]
-// #[panic_handler]
-// fn panic(_info: &core::panic::PanicInfo) -> ! {
-//     loop {}
-// }
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
