@@ -11,6 +11,10 @@ struct Opt {
     iface: String,
     #[clap(short, long, default_value = "50")]
     percentage: u32,
+    #[clap(long)]
+    valm: bool,
+    #[clap(long)]
+    ipv6: bool,
 }
 
 #[tokio::main]
@@ -55,7 +59,12 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface, percentage } = opt;
+    let Opt {
+        iface,
+        percentage,
+        valm,
+        ipv6,
+    } = opt;
 
     let mut config_map: aya::maps::Array<_, xdp_mirror_common::Config> =
         aya::maps::Array::try_from(ebpf.map_mut("CONFIG").unwrap())?;
@@ -63,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
         0,
         xdp_mirror_common::Config {
             response_probability: percentage,
+            validation_mode: valm as u32,
+            ipv6: ipv6 as u32,
         },
         0,
     )?;
@@ -84,17 +95,22 @@ async fn main() -> anyhow::Result<()> {
     let mut total_rx = 0;
     let mut total_valid_syn = 0;
     let mut total_tx = 0;
+    let mut total_rst = 0;
 
     for cpu_stats in stats.iter() {
         total_rx += cpu_stats.rx;
         total_valid_syn += cpu_stats.valid_syn;
         total_tx += cpu_stats.tx;
+        total_rst += cpu_stats.rst_packets;
     }
 
     println!("=========================");
-    println!("Total Packets Received: {}", total_rx);
-    println!("Valid SYN Packets:      {}", total_valid_syn);
-    println!("SYN-ACKs Sent:          {}", total_tx);
+    println!("Empfangene Pakete gesamt:     {}", total_rx);
+    println!("Valide SYN Pakete:            {}", total_valid_syn);
+    println!("Gesendete Antworten:          {}", total_tx);
+    if valm {
+        println!("Empfangene RST Pakete:        {}", total_rst);
+    }
     println!("=========================");
 
     Ok(())
