@@ -3,19 +3,23 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_get_prandom_u32, bpf_xdp_adjust_tail},
+    cty::c_void,
+    helpers::{bpf_get_prandom_u32, bpf_xdp_adjust_tail, bpf_xdp_load_bytes},
     macros::{map, xdp},
-    maps::{Array, PerCpuArray},
+    maps::{Array, PerCpuArray, RingBuf},
     programs::XdpContext,
 };
 use core::mem;
-use xdp_mirror_common::{Config, Stats};
+use xdp_mirror_common::{Config, ProbeEventHeader, Stats};
 
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 
 #[map]
 static STATS: PerCpuArray<Stats> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static PROBES: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -65,12 +69,81 @@ pub struct TcpHdr {
     pub urg_ptr: u16,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct UdpHdr {
+    pub source: u16,
+    pub dest: u16,
+    pub len: u16,
+    pub check: u16,
+}
+
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_ACK: u8 = 0x10;
+const ICMPV4_ECHO_REQUEST: u8 = 8;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMPV4_ECHO_REPLY: u8 = 0;
+const ICMPV6_ECHO_REPLY: u8 = 129;
+const ICMP_ECHO_MSG_LEN: usize = 24;
+// Fixed reservation size per ring entry. aya's RingBuf verifier requires a
+// compile-time-constant size, so we reserve a fixed 1024 bytes for every
+// entry (header + optional UDP payload up to 944 bytes). TCP/ICMP entries
+// only use 80 bytes but still consume 1024 in the ring.
+const PROBE_ENTRY_SIZE: usize = 1024;
+
+enum Action {
+    Mirror,
+    PushRing,
+    Drop,
+}
+
+#[inline(always)]
+fn decide(config: &Config, dst_ip_even: bool) -> Action {
+    match config.mode {
+        1 => Action::PushRing,
+        2 => {
+            if dst_ip_even {
+                Action::Mirror
+            } else {
+                Action::PushRing
+            }
+        }
+        _ => {
+            let is_hit = if config.validation_mode != 0 {
+                dst_ip_even
+            } else {
+                let rnd = unsafe { bpf_get_prandom_u32() };
+                rnd % 100 < config.response_probability
+            };
+            if is_hit { Action::Mirror } else { Action::Drop }
+        }
+    }
+}
+
+#[inline(always)]
+fn proto_matches(config_proto: u32, ip_proto: u8, ipv6: bool) -> bool {
+    match config_proto {
+        0 => true,
+        1 => ip_proto == IPPROTO_TCP,
+        2 => ip_proto == IPPROTO_UDP,
+        3 => ip_proto == if ipv6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP },
+        _ => true,
+    }
+}
+
+#[inline(always)]
+fn expand_v4(addr: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&addr.to_ne_bytes());
+    out
+}
 
 #[xdp]
 pub fn xdp_mirror(ctx: XdpContext) -> u32 {
@@ -113,7 +186,7 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
         u16::from_be(ETH_P_IP)
     };
     if unsafe { (*eth_hdr).ether_type } != expected_ether_type {
-        return Ok(xdp_action::XDP_DROP);
+        return Ok(xdp_action::XDP_PASS);
     }
 
     let src_mac = unsafe { (*eth_hdr).src_addr };
@@ -121,107 +194,48 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
 
     if ipv6_mode {
         let ipv6_hdr: *const Ipv6Hdr = ptr_at(&ctx, mem::size_of::<EthHdr>())?;
-        if unsafe { (*ipv6_hdr).next_header } != IPPROTO_TCP {
-            return Ok(xdp_action::XDP_DROP);
+        let ip_proto = unsafe { (*ipv6_hdr).next_header };
+        if !proto_matches(config.protocol, ip_proto, true) {
+            return Ok(xdp_action::XDP_PASS);
         }
-
-        let tcp_hdr: *const TcpHdr =
-            ptr_at(&ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>())?;
-
-        if config.validation_mode != 0
-            && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0)
-            && let Some(stats) = STATS.get_ptr_mut(0)
-        {
-            unsafe { (*stats).rst_packets += 1 };
-        }
-
-        if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
-            return Ok(xdp_action::XDP_DROP);
-        }
-
-        if let Some(stats) = STATS.get_ptr_mut(0) {
-            unsafe { (*stats).valid_syn += 1 };
-        }
-
-        if config.validation_mode != 0 {
-            let dst_last = unsafe { (*ipv6_hdr).dst_addr[15] };
-            if dst_last % 2 != 0 {
-                return Ok(xdp_action::XDP_DROP);
-            }
-        } else {
-            let rnd = unsafe { bpf_get_prandom_u32() };
-            if (rnd % 100) >= config.response_probability {
-                return Ok(xdp_action::XDP_DROP);
-            }
-        }
-
-        let src_ip = unsafe { (*ipv6_hdr).src_addr };
-        let dst_ip = unsafe { (*ipv6_hdr).dst_addr };
-        let src_port = unsafe { (*tcp_hdr).source };
-        let dst_port = unsafe { (*tcp_hdr).dest };
-        let seq = unsafe { u32::from_be((*tcp_hdr).seq) };
-
-        let new_len =
-            mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>() + mem::size_of::<TcpHdr>();
-        let old_len = ctx.data_end() - ctx.data();
-        let delta = (new_len as isize) - (old_len as isize);
-
-        if delta != 0 {
-            let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
-            if ret != 0 {
-                return Err(xdp_action::XDP_ABORTED);
-            }
-        }
-
-        let eth_hdr: *mut EthHdr = ptr_at(&ctx, 0)?;
-        let ipv6_hdr: *mut Ipv6Hdr = ptr_at(&ctx, mem::size_of::<EthHdr>())?;
-        let tcp_hdr: *mut TcpHdr =
-            ptr_at(&ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>())?;
-
-        unsafe {
-            (*eth_hdr).src_addr = dst_mac;
-            (*eth_hdr).dst_addr = src_mac;
-
-            (*ipv6_hdr).version_tc_flow = u32::to_be(6 << 28);
-            (*ipv6_hdr).payload_len = u16::to_be(mem::size_of::<TcpHdr>() as u16);
-            (*ipv6_hdr).next_header = IPPROTO_TCP;
-            (*ipv6_hdr).hop_limit = 64;
-            (*ipv6_hdr).src_addr = dst_ip;
-            (*ipv6_hdr).dst_addr = src_ip;
-
-            (*tcp_hdr).source = dst_port;
-            (*tcp_hdr).dest = src_port;
-            (*tcp_hdr).seq = bpf_get_prandom_u32();
-            (*tcp_hdr).ack_seq = u32::to_be(seq + 1);
-            (*tcp_hdr).doff_res = 0x50;
-            (*tcp_hdr).flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
-            (*tcp_hdr).window = u16::to_be(64240);
-            (*tcp_hdr).check = 0;
-            (*tcp_hdr).urg_ptr = 0;
-            (*tcp_hdr).check = tcp_v6_csum(ipv6_hdr, tcp_hdr);
-        }
-
-        if let Some(stats) = STATS.get_ptr_mut(0) {
-            unsafe { (*stats).tx += 1 };
-        }
-
-        return Ok(xdp_action::XDP_TX);
+        return match ip_proto {
+            IPPROTO_TCP => handle_tcp_v6(&ctx, ipv6_hdr, src_mac, dst_mac, &config),
+            IPPROTO_UDP => handle_udp_v6(&ctx, ipv6_hdr, src_mac, dst_mac, &config),
+            IPPROTO_ICMPV6 => handle_icmp_v6(&ctx, ipv6_hdr, src_mac, dst_mac, &config),
+            _ => Ok(xdp_action::XDP_PASS),
+        };
     }
 
     let ipv4_hdr: *const Ipv4Hdr = ptr_at(&ctx, mem::size_of::<EthHdr>())?;
-    if unsafe { (*ipv4_hdr).proto } != IPPROTO_TCP {
-        return Ok(xdp_action::XDP_DROP);
+    let ip_proto = unsafe { (*ipv4_hdr).proto };
+    if !proto_matches(config.protocol, ip_proto, false) {
+        return Ok(xdp_action::XDP_PASS);
     }
-
     let ihl = unsafe { (*ipv4_hdr).version_ihl } & 0x0F;
     let ip_hdr_len = (ihl as usize) * 4;
-    let tcp_hdr: *const TcpHdr = ptr_at(&ctx, mem::size_of::<EthHdr>() + ip_hdr_len)?;
+    match ip_proto {
+        IPPROTO_TCP => handle_tcp_v4(&ctx, ipv4_hdr, ip_hdr_len, src_mac, dst_mac, &config),
+        IPPROTO_UDP => handle_udp_v4(&ctx, ipv4_hdr, ip_hdr_len, src_mac, dst_mac, &config),
+        IPPROTO_ICMP => handle_icmp_v4(&ctx, ipv4_hdr, ip_hdr_len, src_mac, dst_mac, &config),
+        _ => Ok(xdp_action::XDP_PASS),
+    }
+}
 
-    if config.validation_mode != 0
-        && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0)
-        && let Some(stats) = STATS.get_ptr_mut(0)
-    {
-        unsafe { (*stats).rst_packets += 1 };
+#[inline(always)]
+fn handle_tcp_v4(
+    ctx: &XdpContext,
+    ipv4_hdr: *const Ipv4Hdr,
+    ip_hdr_len: usize,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let tcp_hdr: *const TcpHdr = ptr_at(ctx, mem::size_of::<EthHdr>() + ip_hdr_len)?;
+
+    if config.validation_mode != 0 && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0) {
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            unsafe { (*stats).rst_packets += 1 };
+        }
     }
 
     if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
@@ -232,70 +246,564 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
         unsafe { (*stats).valid_syn += 1 };
     }
 
-    if config.validation_mode != 0 {
-        let dst_addr = unsafe { (*ipv4_hdr).dst_addr };
-        if u32::from_be(dst_addr) % 2 != 0 {
-            return Ok(xdp_action::XDP_DROP);
+    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let src_ip = unsafe { (*ipv4_hdr).src_addr };
+            let dst_ip = unsafe { (*ipv4_hdr).dst_addr };
+            let src_port = unsafe { (*tcp_hdr).source };
+            let dst_port = unsafe { (*tcp_hdr).dest };
+            let seq = unsafe { u32::from_be((*tcp_hdr).seq) };
+
+            let new_len =
+                mem::size_of::<EthHdr>() + mem::size_of::<Ipv4Hdr>() + mem::size_of::<TcpHdr>();
+            let old_len = ctx.data_end() - ctx.data();
+            let delta = (new_len as isize) - (old_len as isize);
+
+            if delta != 0 {
+                let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
+                if ret != 0 {
+                    return Err(xdp_action::XDP_ABORTED);
+                }
+            }
+
+            let eth_hdr: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let tcp: *mut TcpHdr =
+                ptr_at(ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv4Hdr>())?;
+
+            unsafe {
+                (*eth_hdr).src_addr = dst_mac;
+                (*eth_hdr).dst_addr = src_mac;
+
+                (*ip).version_ihl = 0x45;
+                (*ip).tot_len = u16::to_be(40);
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+                (*ip).check = 0;
+                (*ip).check = ipv4_csum(ip);
+
+                (*tcp).source = dst_port;
+                (*tcp).dest = src_port;
+                (*tcp).seq = bpf_get_prandom_u32();
+                (*tcp).ack_seq = u32::to_be(seq + 1);
+                (*tcp).doff_res = 0x50;
+                (*tcp).flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
+                (*tcp).window = u16::to_be(64240);
+                (*tcp).check = 0;
+                (*tcp).urg_ptr = 0;
+                (*tcp).check = tcp_v4_csum(ip, tcp);
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
         }
-    } else {
-        let rnd = unsafe { bpf_get_prandom_u32() };
-        if (rnd % 100) >= config.response_probability {
-            return Ok(xdp_action::XDP_DROP);
+        Action::PushRing => {
+            let hdr = ProbeEventHeader {
+                protocol: IPPROTO_TCP,
+                version: 4,
+                _pad: [0, 0],
+                src_mac,
+                dst_mac,
+                src_ip: expand_v4(unsafe { (*ipv4_hdr).src_addr }),
+                dst_ip: expand_v4(unsafe { (*ipv4_hdr).dst_addr }),
+                src_port: unsafe { (*tcp_hdr).source },
+                dst_port: unsafe { (*tcp_hdr).dest },
+                tcp_seq: unsafe { (*tcp_hdr).seq },
+                icmp_type: 0,
+                icmp_code: 0,
+                icmp_id: [0, 0],
+                icmp_seq: [0, 0],
+                icmp_payload: [0; 16],
+                udp_payload_len: 0,
+            };
+            Ok(push_probe_event(ctx, &hdr, 0, 0))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn handle_tcp_v6(
+    ctx: &XdpContext,
+    ipv6_hdr: *const Ipv6Hdr,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let tcp_hdr: *const TcpHdr = ptr_at(ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>())?;
+
+    if config.validation_mode != 0 && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0) {
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            unsafe { (*stats).rst_packets += 1 };
         }
     }
 
-    let src_ip = unsafe { (*ipv4_hdr).src_addr };
-    let dst_ip = unsafe { (*ipv4_hdr).dst_addr };
-    let src_port = unsafe { (*tcp_hdr).source };
-    let dst_port = unsafe { (*tcp_hdr).dest };
-    let seq = unsafe { u32::from_be((*tcp_hdr).seq) };
-
-    let new_len = mem::size_of::<EthHdr>() + mem::size_of::<Ipv4Hdr>() + mem::size_of::<TcpHdr>();
-    let old_len = ctx.data_end() - ctx.data();
-    let delta = (new_len as isize) - (old_len as isize);
-
-    if delta != 0 {
-        let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
-        if ret != 0 {
-            return Err(xdp_action::XDP_ABORTED);
-        }
+    if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
+        return Ok(xdp_action::XDP_DROP);
     }
-
-    let eth_hdr: *mut EthHdr = ptr_at(&ctx, 0)?;
-    let ipv4_hdr: *mut Ipv4Hdr = ptr_at(&ctx, mem::size_of::<EthHdr>())?;
-    let tcp_hdr: *mut TcpHdr = ptr_at(&ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv4Hdr>())?;
-
-    unsafe {
-        (*eth_hdr).src_addr = dst_mac;
-        (*eth_hdr).dst_addr = src_mac;
-
-        (*ipv4_hdr).version_ihl = 0x45;
-        (*ipv4_hdr).tot_len = u16::to_be(40);
-        (*ipv4_hdr).src_addr = dst_ip;
-        (*ipv4_hdr).dst_addr = src_ip;
-        (*ipv4_hdr).check = 0;
-        (*ipv4_hdr).check = ipv4_csum(ipv4_hdr);
-
-        (*tcp_hdr).source = dst_port;
-        (*tcp_hdr).dest = src_port;
-        (*tcp_hdr).seq = bpf_get_prandom_u32();
-        (*tcp_hdr).ack_seq = u32::to_be(seq + 1);
-        (*tcp_hdr).doff_res = 0x50;
-        (*tcp_hdr).flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
-        (*tcp_hdr).window = u16::to_be(64240);
-        (*tcp_hdr).check = 0;
-        (*tcp_hdr).urg_ptr = 0;
-
-        (*tcp_hdr).check = tcp_v4_csum(ipv4_hdr, tcp_hdr);
-    }
-
-    // info!(&ctx, "sent SYN-ACK");
 
     if let Some(stats) = STATS.get_ptr_mut(0) {
-        unsafe { (*stats).tx += 1 };
+        unsafe { (*stats).valid_syn += 1 };
     }
 
-    Ok(xdp_action::XDP_TX)
+    let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let src_ip = unsafe { (*ipv6_hdr).src_addr };
+            let dst_ip = unsafe { (*ipv6_hdr).dst_addr };
+            let src_port = unsafe { (*tcp_hdr).source };
+            let dst_port = unsafe { (*tcp_hdr).dest };
+            let seq = unsafe { u32::from_be((*tcp_hdr).seq) };
+
+            let new_len =
+                mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>() + mem::size_of::<TcpHdr>();
+            let old_len = ctx.data_end() - ctx.data();
+            let delta = (new_len as isize) - (old_len as isize);
+
+            if delta != 0 {
+                let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
+                if ret != 0 {
+                    return Err(xdp_action::XDP_ABORTED);
+                }
+            }
+
+            let eth_hdr: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let tcp: *mut TcpHdr =
+                ptr_at(ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>())?;
+
+            unsafe {
+                (*eth_hdr).src_addr = dst_mac;
+                (*eth_hdr).dst_addr = src_mac;
+
+                (*ip).version_tc_flow = u32::to_be(6 << 28);
+                (*ip).payload_len = u16::to_be(mem::size_of::<TcpHdr>() as u16);
+                (*ip).next_header = IPPROTO_TCP;
+                (*ip).hop_limit = 64;
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+
+                (*tcp).source = dst_port;
+                (*tcp).dest = src_port;
+                (*tcp).seq = bpf_get_prandom_u32();
+                (*tcp).ack_seq = u32::to_be(seq + 1);
+                (*tcp).doff_res = 0x50;
+                (*tcp).flags = TCP_FLAG_SYN | TCP_FLAG_ACK;
+                (*tcp).window = u16::to_be(64240);
+                (*tcp).check = 0;
+                (*tcp).urg_ptr = 0;
+                (*tcp).check = tcp_v6_csum(ip, tcp);
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
+        }
+        Action::PushRing => {
+            let hdr = ProbeEventHeader {
+                protocol: IPPROTO_TCP,
+                version: 6,
+                _pad: [0, 0],
+                src_mac,
+                dst_mac,
+                src_ip: unsafe { (*ipv6_hdr).src_addr },
+                dst_ip: unsafe { (*ipv6_hdr).dst_addr },
+                src_port: unsafe { (*tcp_hdr).source },
+                dst_port: unsafe { (*tcp_hdr).dest },
+                tcp_seq: unsafe { (*tcp_hdr).seq },
+                icmp_type: 0,
+                icmp_code: 0,
+                icmp_id: [0, 0],
+                icmp_seq: [0, 0],
+                icmp_payload: [0; 16],
+                udp_payload_len: 0,
+            };
+            Ok(push_probe_event(ctx, &hdr, 0, 0))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn handle_udp_v4(
+    ctx: &XdpContext,
+    ipv4_hdr: *const Ipv4Hdr,
+    ip_hdr_len: usize,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let udp_off = mem::size_of::<EthHdr>() + ip_hdr_len;
+    let udp_hdr: *const UdpHdr = ptr_at(ctx, udp_off)?;
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).udp_rx += 1 };
+    }
+
+    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let udp: *mut UdpHdr = ptr_at(ctx, udp_off)?;
+
+            // Checksum-neutral swap: the one's complement sum is commutative,
+            // so swapping equal-sized src<->dst IP and src<->dst port fields
+            // keeps both the IPv4 header checksum and the UDP checksum valid
+            // without recompute. Do NOT add non-swap mutations (TTL, tot_len,
+            // payload) without recomputing checksums afterwards.
+            unsafe {
+                (*eth).src_addr = dst_mac;
+                (*eth).dst_addr = src_mac;
+                let src_ip = (*ip).src_addr;
+                let dst_ip = (*ip).dst_addr;
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+                let src_port = (*udp).source;
+                let dst_port = (*udp).dest;
+                (*udp).source = dst_port;
+                (*udp).dest = src_port;
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).udp_tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
+        }
+        Action::PushRing => {
+            let payload_len = u16::from_be(unsafe { (*udp_hdr).len }).saturating_sub(8) as usize;
+            let payload_off = udp_off + mem::size_of::<UdpHdr>();
+            const MAX_PAYLOAD: usize = PROBE_ENTRY_SIZE - mem::size_of::<ProbeEventHeader>();
+            let capped = if payload_len > MAX_PAYLOAD {
+                MAX_PAYLOAD
+            } else {
+                payload_len
+            };
+            let hdr = ProbeEventHeader {
+                protocol: IPPROTO_UDP,
+                version: 4,
+                _pad: [0, 0],
+                src_mac,
+                dst_mac,
+                src_ip: expand_v4(unsafe { (*ipv4_hdr).src_addr }),
+                dst_ip: expand_v4(unsafe { (*ipv4_hdr).dst_addr }),
+                src_port: unsafe { (*udp_hdr).source },
+                dst_port: unsafe { (*udp_hdr).dest },
+                tcp_seq: 0,
+                icmp_type: 0,
+                icmp_code: 0,
+                icmp_id: [0, 0],
+                icmp_seq: [0, 0],
+                icmp_payload: [0; 16],
+                udp_payload_len: u16::to_be(capped as u16),
+            };
+            Ok(push_probe_event(ctx, &hdr, payload_off, capped))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn handle_udp_v6(
+    ctx: &XdpContext,
+    ipv6_hdr: *const Ipv6Hdr,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let udp_off = mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>();
+    let udp_hdr: *const UdpHdr = ptr_at(ctx, udp_off)?;
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).udp_rx += 1 };
+    }
+
+    let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let udp: *mut UdpHdr = ptr_at(ctx, udp_off)?;
+
+            // Checksum-neutral swap: see handle_udp_v4 for rationale.
+            unsafe {
+                (*eth).src_addr = dst_mac;
+                (*eth).dst_addr = src_mac;
+                let src_ip = (*ip).src_addr;
+                let dst_ip = (*ip).dst_addr;
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+                (*ip).hop_limit = 64;
+                let src_port = (*udp).source;
+                let dst_port = (*udp).dest;
+                (*udp).source = dst_port;
+                (*udp).dest = src_port;
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).udp_tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
+        }
+        Action::PushRing => {
+            let payload_len = u16::from_be(unsafe { (*udp_hdr).len }).saturating_sub(8) as usize;
+            let payload_off = udp_off + mem::size_of::<UdpHdr>();
+            const MAX_PAYLOAD: usize = PROBE_ENTRY_SIZE - mem::size_of::<ProbeEventHeader>();
+            let capped = if payload_len > MAX_PAYLOAD {
+                MAX_PAYLOAD
+            } else {
+                payload_len
+            };
+            let hdr = ProbeEventHeader {
+                protocol: IPPROTO_UDP,
+                version: 6,
+                _pad: [0, 0],
+                src_mac,
+                dst_mac,
+                src_ip: unsafe { (*ipv6_hdr).src_addr },
+                dst_ip: unsafe { (*ipv6_hdr).dst_addr },
+                src_port: unsafe { (*udp_hdr).source },
+                dst_port: unsafe { (*udp_hdr).dest },
+                tcp_seq: 0,
+                icmp_type: 0,
+                icmp_code: 0,
+                icmp_id: [0, 0],
+                icmp_seq: [0, 0],
+                icmp_payload: [0; 16],
+                udp_payload_len: u16::to_be(capped as u16),
+            };
+            Ok(push_probe_event(ctx, &hdr, payload_off, capped))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn handle_icmp_v4(
+    ctx: &XdpContext,
+    ipv4_hdr: *const Ipv4Hdr,
+    ip_hdr_len: usize,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let icmp_off = mem::size_of::<EthHdr>() + ip_hdr_len;
+    let icmp_base: *mut u8 = ptr_at::<[u8; ICMP_ECHO_MSG_LEN]>(ctx, icmp_off)? as *mut u8;
+
+    if unsafe { *icmp_base } != ICMPV4_ECHO_REQUEST {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).icmp_rx += 1 };
+    }
+
+    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let icmp: *mut u8 = ptr_at::<[u8; ICMP_ECHO_MSG_LEN]>(ctx, icmp_off)? as *mut u8;
+
+            unsafe {
+                (*eth).src_addr = dst_mac;
+                (*eth).dst_addr = src_mac;
+                let src_ip = (*ip).src_addr;
+                let dst_ip = (*ip).dst_addr;
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+                (*ip).check = 0;
+                (*ip).check = ipv4_csum(ip);
+
+                *icmp = ICMPV4_ECHO_REPLY;
+                *(icmp.add(1)) = 0;
+                *(icmp.add(2)) = 0;
+                *(icmp.add(3)) = 0;
+                let csum = icmp_v4_csum(icmp);
+                *(icmp.add(2) as *mut u16) = csum;
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).icmp_tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
+        }
+        Action::PushRing => {
+            let hdr = build_icmp_event(
+                IPPROTO_ICMP,
+                4,
+                src_mac,
+                dst_mac,
+                expand_v4(unsafe { (*ipv4_hdr).src_addr }),
+                expand_v4(unsafe { (*ipv4_hdr).dst_addr }),
+                icmp_base,
+            );
+            Ok(push_probe_event(ctx, &hdr, 0, 0))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn handle_icmp_v6(
+    ctx: &XdpContext,
+    ipv6_hdr: *const Ipv6Hdr,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    config: &Config,
+) -> Result<u32, u32> {
+    let icmp_off = mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>();
+    let icmp_base: *mut u8 = ptr_at::<[u8; ICMP_ECHO_MSG_LEN]>(ctx, icmp_off)? as *mut u8;
+
+    if unsafe { *icmp_base } != ICMPV6_ECHO_REQUEST {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).icmp_rx += 1 };
+    }
+
+    let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+
+    match decide(config, dst_ip_even) {
+        Action::Mirror => {
+            let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+            let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+            let icmp: *mut u8 = ptr_at::<[u8; ICMP_ECHO_MSG_LEN]>(ctx, icmp_off)? as *mut u8;
+
+            unsafe {
+                (*eth).src_addr = dst_mac;
+                (*eth).dst_addr = src_mac;
+                let src_ip = (*ip).src_addr;
+                let dst_ip = (*ip).dst_addr;
+                (*ip).src_addr = dst_ip;
+                (*ip).dst_addr = src_ip;
+                (*ip).hop_limit = 64;
+
+                *icmp = ICMPV6_ECHO_REPLY;
+                *(icmp.add(1)) = 0;
+                *(icmp.add(2)) = 0;
+                *(icmp.add(3)) = 0;
+                let csum = icmp_v6_csum(ip, icmp);
+                *(icmp.add(2) as *mut u16) = csum;
+            }
+
+            if let Some(stats) = STATS.get_ptr_mut(0) {
+                unsafe { (*stats).icmp_tx += 1 };
+            }
+
+            Ok(xdp_action::XDP_TX)
+        }
+        Action::PushRing => {
+            let hdr = build_icmp_event(
+                IPPROTO_ICMPV6,
+                6,
+                src_mac,
+                dst_mac,
+                unsafe { (*ipv6_hdr).src_addr },
+                unsafe { (*ipv6_hdr).dst_addr },
+                icmp_base,
+            );
+            Ok(push_probe_event(ctx, &hdr, 0, 0))
+        }
+        Action::Drop => Ok(xdp_action::XDP_DROP),
+    }
+}
+
+#[inline(always)]
+fn build_icmp_event(
+    protocol: u8,
+    version: u8,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    icmp_base: *const u8,
+) -> ProbeEventHeader {
+    let mut payload = [0u8; 16];
+    unsafe {
+        core::ptr::copy_nonoverlapping(icmp_base.add(8), payload.as_mut_ptr(), 16);
+    }
+    ProbeEventHeader {
+        protocol,
+        version,
+        _pad: [0, 0],
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        icmp_type: unsafe { *icmp_base },
+        icmp_code: unsafe { *icmp_base.add(1) },
+        icmp_id: [unsafe { *icmp_base.add(4) }, unsafe { *icmp_base.add(5) }],
+        icmp_seq: [unsafe { *icmp_base.add(6) }, unsafe { *icmp_base.add(7) }],
+        icmp_payload: payload,
+        udp_payload_len: 0,
+    }
+}
+
+#[inline(always)]
+fn push_probe_event(
+    ctx: &XdpContext,
+    hdr: &ProbeEventHeader,
+    payload_off: usize,
+    payload_len: usize,
+) -> u32 {
+    let hdr_size = mem::size_of::<ProbeEventHeader>();
+    if let Some(mut entry) = PROBES.reserve::<[u8; PROBE_ENTRY_SIZE]>(0) {
+        let buf = entry.as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hdr as *const ProbeEventHeader as *const u8,
+                buf,
+                hdr_size,
+            );
+        }
+        let mut ok = true;
+        // The eBPF verifier rejects bpf_xdp_load_bytes with a zero-sized
+        // length. The `if payload_len > 0` guard is optimized by the compiler
+        // to compare against the original UDP length field, which the verifier
+        // can't connect back to `payload_len`. Using max(1, payload_len)
+        // guarantees a minimum of 1 to the verifier. When payload_len is 0,
+        // 1 byte is read but ignored (the sniffer checks udp_payload_len in
+        // the header, which is 0 for non-payload cases).
+        let load_len = core::cmp::max(1, payload_len) as u32;
+        let ret = unsafe {
+            bpf_xdp_load_bytes(
+                ctx.ctx,
+                payload_off as u32,
+                buf.add(hdr_size) as *mut c_void,
+                load_len,
+            )
+        };
+        if ret < 0 && payload_len > 0 {
+            ok = false;
+        }
+        if ok {
+            entry.submit(0);
+        } else {
+            entry.discard(0);
+        }
+    } else if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).ring_dropped += 1 };
+    }
+    xdp_action::XDP_DROP
 }
 
 unsafe fn ipv4_csum(hdr: *mut Ipv4Hdr) -> u16 {
@@ -355,6 +863,47 @@ unsafe fn tcp_v6_csum(ip_hdr: *mut Ipv6Hdr, tcp_hdr: *mut TcpHdr) -> u16 {
     let tcp_ptr = tcp_hdr as *const u16;
     for i in 0..10 {
         sum += unsafe { *tcp_ptr.add(i) } as u32;
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+unsafe fn icmp_v4_csum(icmp_base: *const u8) -> u16 {
+    let ptr = icmp_base as *const u16;
+    let mut sum = 0u32;
+    for i in 0..12 {
+        sum += unsafe { *ptr.add(i) } as u32;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+unsafe fn icmp_v6_csum(ip_hdr: *const Ipv6Hdr, icmp_base: *const u8) -> u16 {
+    let mut sum = 0u32;
+
+    let src_ptr = unsafe { (*ip_hdr).src_addr.as_ptr() } as *const u16;
+    for i in 0..8 {
+        sum += unsafe { *src_ptr.add(i) } as u32;
+    }
+
+    let dst_ptr = unsafe { (*ip_hdr).dst_addr.as_ptr() } as *const u16;
+    for i in 0..8 {
+        sum += unsafe { *dst_ptr.add(i) } as u32;
+    }
+
+    let icmp_len = ICMP_ECHO_MSG_LEN as u32;
+    sum += u16::to_be((icmp_len >> 16) as u16) as u32;
+    sum += u16::to_be((icmp_len & 0xFFFF) as u16) as u32;
+    sum += u16::to_be(IPPROTO_ICMPV6 as u16) as u32;
+
+    let icmp_ptr = icmp_base as *const u16;
+    for i in 0..12 {
+        sum += unsafe { *icmp_ptr.add(i) } as u32;
     }
 
     while (sum >> 16) != 0 {
