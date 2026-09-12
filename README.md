@@ -20,6 +20,70 @@ cargo run --release
 Cargo build scripts are used to automatically build the eBPF correctly and include it in the
 program.
 
+## Modes & Protocols
+
+DummyReceiver has three mutually-exclusive modes, selected via `--mode`:
+
+- `ebpf` (default): eBPF mirrors filter-hits (valm/percentage) at line rate; non-hits are dropped in-kernel — no userspace sniffer.
+- `raw`: eBPF pushes every valid probe to a RingBuf and drops it; a userspace sniffer drains the RingBuf and crafts responses (enables edge cases).
+- `both`: eBPF mirrors even-IP hits at line rate; odd-IP probes go to the sniffer.
+
+Select the protocol to respond to with `--protocol`:
+
+- `--protocol any` (default) — respond to TCP, UDP, and ICMP
+- `--protocol tcp` — TCP only
+- `--protocol udp` — UDP only
+- `--protocol icmp` — ICMP only
+
+### Response mode flags
+
+- `--valm` — deterministic mode: respond only to even-destination-IP targets (all protocols). When omitted, `--percentage N` controls the random response probability.
+- `--ipv6` — operate in IPv6 mode (parse/emit IPv6 headers instead of IPv4).
+- `--percentage N` — response probability 0-100 (default 50). Ignored in `--valm` mode.
+
+### Edge-case flags (raw/both modes)
+
+The userspace sniffer supports edge-case behavior:
+
+- `--count N` — send N responses per probe (default 1)
+- `--delay MS` — delay MS milliseconds before responding
+- `--fake-ip IP` — use a fake source IP (tests scanner forgery defense)
+- `--closed` — simulate a closed port/host (TCP RST / UDP ICMP Port-Unreach / ICMP silence)
+
+### Usage examples
+
+TCP:
+
+```shell
+./run.sh eth0 50
+./run.sh eth0 50 --valm
+```
+
+UDP:
+
+```shell
+./run.sh eth0 50 --protocol udp
+```
+
+ICMP:
+
+```shell
+./run.sh eth0 50 --protocol icmp
+```
+
+Raw mode edge cases:
+
+```shell
+./run.sh eth0 50 --mode raw --count 3
+./run.sh eth0 50 --mode raw --closed
+```
+
+Both mode:
+
+```shell
+./run.sh eth0 50 --mode both
+```
+
 ## Cross-compiling on macOS
 
 Cross compilation should work on both Intel and Apple Silicon Macs.

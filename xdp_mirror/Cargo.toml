@@ -14,12 +14,15 @@ aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+nix = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
     "rt-multi-thread",
     "net",
     "signal",
+    "sync",
+    "time",
 ] }
 clap = { workspace = true, features = ["derive"] }
 [build-dependencies]

@@ -1,9 +1,19 @@
+mod sniffer;
+
+use std::{
+    net::IpAddr,
+    str::FromStr,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
+
 use anyhow::Context as _;
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
-#[rustfmt::skip]
-use log::{debug, warn};
-use tokio::signal;
+use log::debug;
+use tokio::{signal, sync::watch};
+
+use sniffer::{SnifferConfig, SnifferStats};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -15,6 +25,18 @@ struct Opt {
     valm: bool,
     #[clap(long)]
     ipv6: bool,
+    #[clap(long, default_value = "ebpf")]
+    mode: String,
+    #[clap(long, default_value = "any")]
+    protocol: String,
+    #[clap(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..=10000))]
+    count: u32,
+    #[clap(long, default_value = "0")]
+    delay: u64,
+    #[clap(long)]
+    fake_ip: Option<String>,
+    #[clap(long)]
+    closed: bool,
 }
 
 #[tokio::main]
@@ -45,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
-            warn!("failed to initialize eBPF logger: {e}");
+            debug!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
             let mut logger =
@@ -64,44 +86,145 @@ async fn main() -> anyhow::Result<()> {
         percentage,
         valm,
         ipv6,
+        mode,
+        protocol,
+        count,
+        delay,
+        fake_ip,
+        closed,
     } = opt;
 
+    let mode_code = match mode.as_str() {
+        "ebpf" => 0,
+        "raw" => 1,
+        "both" => 2,
+        _ => anyhow::bail!("invalid mode: {}", mode),
+    };
+
+    let protocol_code = match protocol.as_str() {
+        "any" => 0,
+        "tcp" => 1,
+        "udp" => 2,
+        "icmp" => 3,
+        _ => anyhow::bail!("invalid protocol: {}", protocol),
+    };
+
     let mut config_map: aya::maps::Array<_, xdp_mirror_common::Config> =
-        aya::maps::Array::try_from(ebpf.map_mut("CONFIG").unwrap())?;
+        aya::maps::Array::try_from(
+            ebpf.map_mut("CONFIG").context("CONFIG map not found")?
+        )?;
     config_map.set(
         0,
         xdp_mirror_common::Config {
             response_probability: percentage,
             validation_mode: valm as u32,
             ipv6: ipv6 as u32,
+            protocol: protocol_code,
+            mode: mode_code,
         },
         0,
     )?;
 
-    let program: &mut Xdp = ebpf.program_mut("xdp_mirror").unwrap().try_into()?;
+    let program: &mut Xdp = ebpf
+        .program_mut("xdp_mirror")
+        .context("xdp_mirror program not found")?
+        .try_into()?;
     program.load()?;
     program.attach(&iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+
+    let needs_sniffer = mode == "raw" || mode == "both";
+    let mut sniffer_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    let mut stop_tx: Option<watch::Sender<bool>> = None;
+    let mut sniffer_stats: Option<Arc<SnifferStats>> = None;
+
+    if needs_sniffer {
+        let ring_buf = aya::maps::RingBuf::try_from(
+            ebpf.take_map("PROBES").context("PROBES map not found")?
+        )?;
+
+        let (fake_ip_bytes, fake_ipv6) = match fake_ip {
+            Some(ip_str) => {
+                let ip: IpAddr = IpAddr::from_str(&ip_str)
+                    .context("failed to parse fake_ip")?;
+                match ip {
+                    IpAddr::V4(v4) => {
+                        let mut bytes = [0u8; 16];
+                        bytes[..4].copy_from_slice(&v4.octets());
+                        (Some(bytes), false)
+                    }
+                    IpAddr::V6(v6) => (Some(v6.octets()), true),
+                }
+            }
+            None => (None, false),
+        };
+
+        let sniffer_config = SnifferConfig {
+            count,
+            delay,
+            fake_ip: fake_ip_bytes,
+            fake_ipv6,
+            closed,
+        };
+        let stats = Arc::new(SnifferStats::default());
+        let (tx, rx) = watch::channel(false);
+
+        let handle = tokio::spawn(sniffer::run_sniffer(
+            ring_buf,
+            iface.clone(),
+            sniffer_config,
+            stats.clone(),
+            rx,
+        ));
+
+        sniffer_handle = Some(handle);
+        stop_tx = Some(tx);
+        sniffer_stats = Some(stats);
+    }
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
     ctrl_c.await?;
     println!("Exiting...");
 
+    if let Some(tx) = stop_tx {
+        let _ = tx.send(true);
+    }
+    if let Some(handle) = sniffer_handle {
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(ref e)) ) => eprintln!("Sniffer error: {e:#}"),
+            Ok(Err(_)) => eprintln!("Sniffer task panicked"),
+            Err(_) => eprintln!("Sniffer did not shut down within 5s"),
+        }
+    }
+
     let stats_map: aya::maps::PerCpuArray<_, xdp_mirror_common::Stats> =
-        aya::maps::PerCpuArray::try_from(ebpf.map("STATS").unwrap())?;
+        aya::maps::PerCpuArray::try_from(
+            ebpf.map("STATS").context("STATS map not found")?
+        )?;
 
     let stats = stats_map.get(&0, 0)?;
     let mut total_rx = 0;
     let mut total_valid_syn = 0;
     let mut total_tx = 0;
     let mut total_rst = 0;
+    let mut total_udp_rx = 0;
+    let mut total_udp_tx = 0;
+    let mut total_icmp_rx = 0;
+    let mut total_icmp_tx = 0;
+    let mut total_ring_dropped = 0;
 
     for cpu_stats in stats.iter() {
         total_rx += cpu_stats.rx;
         total_valid_syn += cpu_stats.valid_syn;
         total_tx += cpu_stats.tx;
         total_rst += cpu_stats.rst_packets;
+        total_udp_rx += cpu_stats.udp_rx;
+        total_udp_tx += cpu_stats.udp_tx;
+        total_icmp_rx += cpu_stats.icmp_rx;
+        total_icmp_tx += cpu_stats.icmp_tx;
+        total_ring_dropped += cpu_stats.ring_dropped;
     }
 
     println!("=========================");
@@ -110,6 +233,19 @@ async fn main() -> anyhow::Result<()> {
     println!("Gesendete Antworten:          {}", total_tx);
     if valm {
         println!("Empfangene RST Pakete:        {}", total_rst);
+    }
+    println!("UDP RX:                       {}", total_udp_rx);
+    println!("UDP TX:                       {}", total_udp_tx);
+    println!("ICMP RX:                      {}", total_icmp_rx);
+    println!("ICMP TX:                      {}", total_icmp_tx);
+    if total_ring_dropped > 0 || needs_sniffer {
+        println!("Ring dropped:                 {}", total_ring_dropped);
+    }
+    if let Some(ref sniffer_st) = sniffer_stats {
+        println!("Sniffer sent:                 {}", sniffer_st.sent.load(Ordering::Relaxed));
+        println!("Sniffer closed_sent:          {}", sniffer_st.closed_sent.load(Ordering::Relaxed));
+        println!("Sniffer fake_sent:            {}", sniffer_st.fake_sent.load(Ordering::Relaxed));
+        println!("Sniffer dropped_ring:         {}", sniffer_st.dropped_ring.load(Ordering::Relaxed));
     }
     println!("=========================");
 
