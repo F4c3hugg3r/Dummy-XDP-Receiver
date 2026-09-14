@@ -11,6 +11,10 @@ pub struct Config {
     pub ipv6: u32,                 // 0 = false, 1 = true
     pub protocol: u32,             // 0 = any, 1 = tcp, 2 = udp, 3 = icmp
     pub mode: u32,                 // 0 = ebpf, 1 = raw, 2 = both
+    pub icmp_error_type: u32,      // 0=none, 1=port-unreach, 2=admin-prohibited,
+                                  // 3=host-unreach, 4=net-unreach, 5=time-exceeded,
+                                  // 6=all (round-robin)
+    pub no_rsp_perc: u32,          // 0-100, % of hits that get no response
 }
 
 #[cfg(feature = "user")]
@@ -28,6 +32,7 @@ pub struct Stats {
     pub icmp_rx: u64,
     pub icmp_tx: u64,
     pub ring_dropped: u64,
+    pub icmp_error_tx: u64,
 }
 
 #[cfg(feature = "user")]

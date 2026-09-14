@@ -92,6 +92,8 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV4_ECHO_REPLY: u8 = 0;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_MSG_LEN: usize = 24;
+const ICMP_ERROR_V4_LEN: usize = 36; // 8 ICMP header + 20 orig IP + 8 orig UDP
+const ICMP_ERROR_V6_LEN: usize = 56; // 8 ICMPv6 header + 40 orig IPv6 + 8 orig UDP
 // Fixed reservation size per ring entry. aya's RingBuf verifier requires a
 // compile-time-constant size, so we reserve a fixed 1024 bytes for every
 // entry (header + optional UDP payload up to 944 bytes). TCP/ICMP entries
@@ -100,17 +102,41 @@ const PROBE_ENTRY_SIZE: usize = 1024;
 
 enum Action {
     Mirror,
+    NoResponse,
+    IcmpError,
     PushRing,
     Drop,
 }
 
+const ICMP_V4_ERRORS: [(u8, u8); 5] = [
+    (3, 3),  // port-unreach
+    (3, 13), // admin-prohibited
+    (3, 1),  // host-unreach
+    (3, 0),  // net-unreach
+    (11, 0), // time-exceeded
+];
+
+const ICMP_V6_ERRORS: [(u8, u8); 5] = [
+    (1, 4), // port-unreach
+    (1, 1), // admin-prohibited
+    (1, 3), // host-unreach
+    (1, 0), // net-unreach
+    (3, 0), // time-exceeded
+];
+
 #[inline(always)]
-fn decide(config: &Config, dst_ip_even: bool) -> Action {
+fn decide(config: &Config, dst_ip_even: bool, no_rsp: bool, is_udp: bool) -> Action {
     match config.mode {
         1 => Action::PushRing,
         2 => {
             if dst_ip_even {
-                Action::Mirror
+                if no_rsp {
+                    Action::NoResponse
+                } else {
+                    Action::Mirror
+                }
+            } else if is_udp && config.icmp_error_type != 0 {
+                Action::IcmpError
             } else {
                 Action::PushRing
             }
@@ -122,9 +148,50 @@ fn decide(config: &Config, dst_ip_even: bool) -> Action {
                 let rnd = unsafe { bpf_get_prandom_u32() };
                 rnd % 100 < config.response_probability
             };
-            if is_hit { Action::Mirror } else { Action::Drop }
+            if is_hit {
+                if no_rsp {
+                    Action::NoResponse
+                } else {
+                    Action::Mirror
+                }
+            } else if is_udp && config.icmp_error_type != 0 {
+                Action::IcmpError
+            } else {
+                Action::Drop
+            }
         }
     }
+}
+
+#[inline(always)]
+fn icmp_type_code(config: &Config, version: u8) -> (u8, u8) {
+    let idx = if config.icmp_error_type == 6 {
+        let i = if let Some(stats) = STATS.get_ptr_mut(0) {
+            let v = unsafe { (*stats).icmp_error_tx };
+            unsafe {
+                (*stats).icmp_error_tx = v.wrapping_add(1);
+            }
+            v as usize
+        } else {
+            0
+        };
+        i % 5
+    } else {
+        (config.icmp_error_type - 1) as usize
+    };
+    // Match instead of array indexing: a runtime index on a fixed-size
+    // array generates a panic_bounds_check handler in .text.unlikely.,
+    // which bpf-linker mishandles (creates BTF func_info but not a
+    // subprogram), causing the kernel verifier to reject the program.
+    // const array indexing with a literal index is compile-time folded.
+    let (v4, v6) = match idx {
+        0 => (ICMP_V4_ERRORS[0], ICMP_V6_ERRORS[0]), // port-unreach
+        1 => (ICMP_V4_ERRORS[1], ICMP_V6_ERRORS[1]), // admin-prohibited
+        2 => (ICMP_V4_ERRORS[2], ICMP_V6_ERRORS[2]), // host-unreach
+        3 => (ICMP_V4_ERRORS[3], ICMP_V6_ERRORS[3]), // net-unreach
+        _ => (ICMP_V4_ERRORS[4], ICMP_V6_ERRORS[4]), // time-exceeded
+    };
+    if version == 4 { v4 } else { v6 }
 }
 
 #[inline(always)]
@@ -232,10 +299,11 @@ fn handle_tcp_v4(
 ) -> Result<u32, u32> {
     let tcp_hdr: *const TcpHdr = ptr_at(ctx, mem::size_of::<EthHdr>() + ip_hdr_len)?;
 
-    if config.validation_mode != 0 && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0) {
-        if let Some(stats) = STATS.get_ptr_mut(0) {
-            unsafe { (*stats).rst_packets += 1 };
-        }
+    if config.validation_mode != 0
+        && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0)
+        && let Some(stats) = STATS.get_ptr_mut(0)
+    {
+        unsafe { (*stats).rst_packets += 1 };
     }
 
     if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
@@ -246,9 +314,11 @@ fn handle_tcp_v4(
         unsafe { (*stats).valid_syn += 1 };
     }
 
-    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+    let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
+    let dst_ip_even = dst_addr_be % 2 == 0;
+    let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
             let src_ip = unsafe { (*ipv4_hdr).src_addr };
             let dst_ip = unsafe { (*ipv4_hdr).dst_addr };
@@ -323,6 +393,8 @@ fn handle_tcp_v4(
             };
             Ok(push_probe_event(ctx, &hdr, 0, 0))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => Ok(xdp_action::XDP_DROP),
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -337,10 +409,11 @@ fn handle_tcp_v6(
 ) -> Result<u32, u32> {
     let tcp_hdr: *const TcpHdr = ptr_at(ctx, mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>())?;
 
-    if config.validation_mode != 0 && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0) {
-        if let Some(stats) = STATS.get_ptr_mut(0) {
-            unsafe { (*stats).rst_packets += 1 };
-        }
+    if config.validation_mode != 0
+        && (unsafe { (*tcp_hdr).flags } & TCP_FLAG_RST != 0)
+        && let Some(stats) = STATS.get_ptr_mut(0)
+    {
+        unsafe { (*stats).rst_packets += 1 };
     }
 
     if unsafe { (*tcp_hdr).flags } & TCP_FLAG_SYN == 0 {
@@ -352,8 +425,9 @@ fn handle_tcp_v6(
     }
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+    let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
             let src_ip = unsafe { (*ipv6_hdr).src_addr };
             let dst_ip = unsafe { (*ipv6_hdr).dst_addr };
@@ -428,6 +502,8 @@ fn handle_tcp_v6(
             };
             Ok(push_probe_event(ctx, &hdr, 0, 0))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => Ok(xdp_action::XDP_DROP),
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -448,9 +524,11 @@ fn handle_udp_v4(
         unsafe { (*stats).udp_rx += 1 };
     }
 
-    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+    let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
+    let dst_ip_even = dst_addr_be % 2 == 0;
+    let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, true) {
         Action::Mirror => {
             let eth: *mut EthHdr = ptr_at(ctx, 0)?;
             let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
@@ -509,6 +587,20 @@ fn handle_udp_v4(
             };
             Ok(push_probe_event(ctx, &hdr, payload_off, capped))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => {
+            let (icmp_type, icmp_code) = icmp_type_code(config, 4);
+            let result = craft_icmp_error_v4(
+                ctx, ipv4_hdr, ip_hdr_len, src_mac, dst_mac, icmp_type, icmp_code,
+            );
+            if config.icmp_error_type != 6
+                && let Some(stats) = STATS.get_ptr_mut(0)
+            {
+                unsafe { (*stats).icmp_error_tx += 1 };
+            }
+
+            result
+        }
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -529,8 +621,9 @@ fn handle_udp_v6(
     }
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+    let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, true) {
         Action::Mirror => {
             let eth: *mut EthHdr = ptr_at(ctx, 0)?;
             let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
@@ -586,6 +679,17 @@ fn handle_udp_v6(
             };
             Ok(push_probe_event(ctx, &hdr, payload_off, capped))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => {
+            let (icmp_type, icmp_code) = icmp_type_code(config, 6);
+            let result = craft_icmp_error_v6(ctx, ipv6_hdr, src_mac, dst_mac, icmp_type, icmp_code);
+            if config.icmp_error_type != 6
+                && let Some(stats) = STATS.get_ptr_mut(0)
+            {
+                unsafe { (*stats).icmp_error_tx += 1 };
+            }
+            result
+        }
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -610,9 +714,11 @@ fn handle_icmp_v4(
         unsafe { (*stats).icmp_rx += 1 };
     }
 
-    let dst_ip_even = u32::from_be(unsafe { (*ipv4_hdr).dst_addr }) % 2 == 0;
+    let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
+    let dst_ip_even = dst_addr_be % 2 == 0;
+    let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
             let eth: *mut EthHdr = ptr_at(ctx, 0)?;
             let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
@@ -654,6 +760,8 @@ fn handle_icmp_v4(
             );
             Ok(push_probe_event(ctx, &hdr, 0, 0))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => Ok(xdp_action::XDP_DROP),
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -678,8 +786,9 @@ fn handle_icmp_v6(
     }
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
+    let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
 
-    match decide(config, dst_ip_even) {
+    match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
             let eth: *mut EthHdr = ptr_at(ctx, 0)?;
             let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
@@ -720,6 +829,8 @@ fn handle_icmp_v6(
             );
             Ok(push_probe_event(ctx, &hdr, 0, 0))
         }
+        Action::NoResponse => Ok(xdp_action::XDP_DROP),
+        Action::IcmpError => Ok(xdp_action::XDP_DROP),
         Action::Drop => Ok(xdp_action::XDP_DROP),
     }
 }
@@ -776,24 +887,24 @@ fn push_probe_event(
             );
         }
         let mut ok = true;
-        // The eBPF verifier rejects bpf_xdp_load_bytes with a zero-sized
-        // length. The `if payload_len > 0` guard is optimized by the compiler
-        // to compare against the original UDP length field, which the verifier
-        // can't connect back to `payload_len`. Using max(1, payload_len)
-        // guarantees a minimum of 1 to the verifier. When payload_len is 0,
-        // 1 byte is read but ignored (the sniffer checks udp_payload_len in
-        // the header, which is 0 for non-payload cases).
-        let load_len = core::cmp::max(1, payload_len) as u32;
-        let ret = unsafe {
-            bpf_xdp_load_bytes(
-                ctx.ctx,
-                payload_off as u32,
-                buf.add(hdr_size) as *mut c_void,
-                load_len,
-            )
-        };
-        if ret < 0 && payload_len > 0 {
-            ok = false;
+        // Only call bpf_xdp_load_bytes when there is payload to copy. The
+        // eBPF verifier rejects bpf_xdp_load_bytes with a zero-sized length.
+        // A volatile read prevents the compiler from substituting the original
+        // UDP length field (which the verifier can't connect back to
+        // payload_len), ensuring the verifier sees the guard clearly.
+        let plen = unsafe { core::ptr::read_volatile(&payload_len) };
+        if plen > 0 {
+            let ret = unsafe {
+                bpf_xdp_load_bytes(
+                    ctx.ctx,
+                    payload_off as u32,
+                    buf.add(hdr_size) as *mut c_void,
+                    plen as u32,
+                )
+            };
+            if ret < 0 {
+                ok = false;
+            }
         }
         if ok {
             entry.submit(0);
@@ -806,13 +917,171 @@ fn push_probe_event(
     xdp_action::XDP_DROP
 }
 
+#[inline(always)]
+fn craft_icmp_error_v4(
+    ctx: &XdpContext,
+    ipv4_hdr: *const Ipv4Hdr,
+    ip_hdr_len: usize,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    icmp_type: u8,
+    icmp_code: u8,
+) -> Result<u32, u32> {
+    if ip_hdr_len != 20 {
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    let orig_src_ip = unsafe { (*ipv4_hdr).src_addr };
+    let orig_dst_ip = unsafe { (*ipv4_hdr).dst_addr };
+
+    let target_len = 70usize;
+    let old_len = ctx.data_end() - ctx.data();
+    let delta = (target_len as isize) - (old_len as isize);
+    if delta != 0 {
+        let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
+        if ret != 0 {
+            return Err(xdp_action::XDP_ABORTED);
+        }
+    }
+
+    let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+    let ip: *mut Ipv4Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+    let icmp_off = mem::size_of::<EthHdr>() + mem::size_of::<Ipv4Hdr>();
+    let icmp: *mut u8 = ptr_at::<[u8; ICMP_ERROR_V4_LEN]>(ctx, icmp_off)? as *mut u8;
+
+    // After adjust_tail, the original IP4 header (20 bytes at offset 14) and
+    // UDP header (8 bytes at offset 34) are still in the packet. Copy them to
+    // the ICMP payload area (offset 42-69).
+    //
+    // Source [14..33] -> dest [42..61] (no overlap)
+    // Source [34..41] -> dest [62..69] (no overlap)
+    let pkt: *mut u8 = ctx.data() as *mut u8;
+    unsafe {
+        for i in 0..20usize {
+            *pkt.add(42 + i) = *pkt.add(14 + i);
+        }
+        for i in 0..8usize {
+            *pkt.add(62 + i) = *pkt.add(34 + i);
+        }
+    }
+
+    unsafe {
+        (*eth).dst_addr = src_mac;
+        (*eth).src_addr = dst_mac;
+        (*eth).ether_type = u16::from_be(ETH_P_IP);
+
+        (*ip).version_ihl = 0x45;
+        (*ip).tos = 0;
+        (*ip).tot_len = u16::to_be(56);
+        (*ip).id = 0;
+        (*ip).frag_off = 0;
+        (*ip).ttl = 64;
+        (*ip).proto = IPPROTO_ICMP;
+        (*ip).check = 0;
+        (*ip).src_addr = orig_dst_ip;
+        (*ip).dst_addr = orig_src_ip;
+        (*ip).check = ipv4_csum(ip);
+
+        *icmp = icmp_type;
+        *(icmp.add(1)) = icmp_code;
+        *(icmp.add(2)) = 0;
+        *(icmp.add(3)) = 0;
+        *(icmp.add(4)) = 0;
+        *(icmp.add(5)) = 0;
+        *(icmp.add(6)) = 0;
+        *(icmp.add(7)) = 0;
+
+        let csum = icmp_v4_error_csum(icmp);
+        *(icmp.add(2) as *mut u16) = csum;
+    }
+
+    Ok(xdp_action::XDP_TX)
+}
+
+#[inline(always)]
+fn craft_icmp_error_v6(
+    ctx: &XdpContext,
+    ipv6_hdr: *const Ipv6Hdr,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    icmp_type: u8,
+    icmp_code: u8,
+) -> Result<u32, u32> {
+    let orig_src_ip = unsafe { (*ipv6_hdr).src_addr };
+    let orig_dst_ip = unsafe { (*ipv6_hdr).dst_addr };
+
+    let target_len = 110usize;
+    let old_len = ctx.data_end() - ctx.data();
+    let delta = (target_len as isize) - (old_len as isize);
+    if delta != 0 {
+        let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) };
+        if ret != 0 {
+            return Err(xdp_action::XDP_ABORTED);
+        }
+    }
+
+    let eth: *mut EthHdr = ptr_at(ctx, 0)?;
+    let ip: *mut Ipv6Hdr = ptr_at(ctx, mem::size_of::<EthHdr>())?;
+    let icmp_off = mem::size_of::<EthHdr>() + mem::size_of::<Ipv6Hdr>();
+    let icmp: *mut u8 = ptr_at::<[u8; ICMP_ERROR_V6_LEN]>(ctx, icmp_off)? as *mut u8;
+
+    // After adjust_tail, the original IPv6 header (40 bytes at offset 14) and
+    // UDP header (8 bytes at offset 54) are still in the packet. Copy them to
+    // the ICMPv6 payload area (offset 62-109).
+    //
+    // Source [14..53] -> dest [62..101] (no overlap)
+    // Source [54..61] -> dest [102..109] (no overlap)
+    let pkt: *mut u8 = ctx.data() as *mut u8;
+    unsafe {
+        for i in 0..40usize {
+            *pkt.add(62 + i) = *pkt.add(14 + i);
+        }
+        for i in 0..8usize {
+            *pkt.add(102 + i) = *pkt.add(54 + i);
+        }
+    }
+
+    unsafe {
+        (*eth).dst_addr = src_mac;
+        (*eth).src_addr = dst_mac;
+        (*eth).ether_type = u16::from_be(ETH_P_IPV6);
+
+        (*ip).version_tc_flow = u32::to_be(6 << 28);
+        (*ip).payload_len = u16::to_be(56);
+        (*ip).next_header = IPPROTO_ICMPV6;
+        (*ip).hop_limit = 64;
+        (*ip).src_addr = orig_dst_ip;
+        (*ip).dst_addr = orig_src_ip;
+
+        *icmp = icmp_type;
+        *(icmp.add(1)) = icmp_code;
+        *(icmp.add(2)) = 0;
+        *(icmp.add(3)) = 0;
+        *(icmp.add(4)) = 0;
+        *(icmp.add(5)) = 0;
+        *(icmp.add(6)) = 0;
+        *(icmp.add(7)) = 0;
+
+        let csum = icmp_v6_error_csum(ip, icmp);
+        *(icmp.add(2) as *mut u16) = csum;
+    }
+
+    Ok(xdp_action::XDP_TX)
+}
+
 unsafe fn ipv4_csum(hdr: *mut Ipv4Hdr) -> u16 {
     let ptr = hdr as *const u16;
     let mut sum = 0u32;
     for i in 0..10 {
         sum += unsafe { *ptr.add(i) } as u32;
     }
-    while (sum >> 16) != 0 {
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
@@ -837,7 +1106,13 @@ unsafe fn tcp_v4_csum(ip_hdr: *mut Ipv4Hdr, tcp_hdr: *mut TcpHdr) -> u16 {
         sum += unsafe { *tcp_ptr.add(i) } as u32;
     }
 
-    while (sum >> 16) != 0 {
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
@@ -865,7 +1140,13 @@ unsafe fn tcp_v6_csum(ip_hdr: *mut Ipv6Hdr, tcp_hdr: *mut TcpHdr) -> u16 {
         sum += unsafe { *tcp_ptr.add(i) } as u32;
     }
 
-    while (sum >> 16) != 0 {
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
@@ -877,7 +1158,13 @@ unsafe fn icmp_v4_csum(icmp_base: *const u8) -> u16 {
     for i in 0..12 {
         sum += unsafe { *ptr.add(i) } as u32;
     }
-    while (sum >> 16) != 0 {
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
@@ -906,7 +1193,66 @@ unsafe fn icmp_v6_csum(ip_hdr: *const Ipv6Hdr, icmp_base: *const u8) -> u16 {
         sum += unsafe { *icmp_ptr.add(i) } as u32;
     }
 
-    while (sum >> 16) != 0 {
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+unsafe fn icmp_v4_error_csum(icmp_base: *const u8) -> u16 {
+    let ptr = icmp_base as *const u16;
+    let mut sum = 0u32;
+    for i in 0..18 {
+        sum += unsafe { *ptr.add(i) } as u32;
+    }
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+unsafe fn icmp_v6_error_csum(ip_hdr: *const Ipv6Hdr, icmp_base: *const u8) -> u16 {
+    let mut sum = 0u32;
+
+    let src_ptr = unsafe { (*ip_hdr).src_addr.as_ptr() } as *const u16;
+    for i in 0..8 {
+        sum += unsafe { *src_ptr.add(i) } as u32;
+    }
+
+    let dst_ptr = unsafe { (*ip_hdr).dst_addr.as_ptr() } as *const u16;
+    for i in 0..8 {
+        sum += unsafe { *dst_ptr.add(i) } as u32;
+    }
+
+    let icmp_len = ICMP_ERROR_V6_LEN as u32;
+    sum += u16::to_be((icmp_len >> 16) as u16) as u32;
+    sum += u16::to_be((icmp_len & 0xFFFF) as u16) as u32;
+    sum += u16::to_be(IPPROTO_ICMPV6 as u16) as u32;
+
+    let icmp_ptr = icmp_base as *const u16;
+    for i in 0..28 {
+        sum += unsafe { *icmp_ptr.add(i) } as u32;
+    }
+
+    // Bounded fold: 2 iterations suffice for all callers (max 47 u16 terms
+    // → initial sum ≤ 0x2EFFD1; after 1 fold ≤ 0x1002D; after 2 ≤ 0xFFFF).
+    // The eBPF verifier's abstract interpretation cannot prove the equivalent
+    // `while (sum >> 16) != 0` loop terminates, because the range widens back
+    // to [0, 0x10000] on each iteration. A bounded `for` loop is trivially
+    // provably terminating.
+    for _ in 0..2 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16

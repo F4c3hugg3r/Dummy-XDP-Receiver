@@ -96,10 +96,10 @@ instead of `XDP_PASS`ed, which could break MAC resolution. Now fixed:
 
 Defined in `xdp_mirror-common`:
 
-- **`Config`** (5 `u32` fields): `response_probability`, `validation_mode`,
-  `ipv6`, `protocol`, `mode`.
-- **`Stats`** (9 `u64` counters): `rx`, `valid_syn`, `tx`, `rst_packets`,
-  `udp_rx`, `udp_tx`, `icmp_rx`, `icmp_tx`, `ring_dropped`.
+- **`Config`** (7 `u32` fields): `response_probability`, `validation_mode`,
+  `ipv6`, `protocol`, `mode`, `icmp_error_type`, `no_rsp_perc`.
+- **`Stats`** (10 `u64` counters): `rx`, `valid_syn`, `tx`, `rst_packets`,
+  `udp_rx`, `udp_tx`, `icmp_rx`, `icmp_tx`, `ring_dropped`, `icmp_error_tx`.
 - **`ProbeEventHeader`**: 80-byte packed struct (`#[repr(C, packed)]`,
   `zerocopy` derives) pushed to the RingBuf. Multi-byte fields (`src_port`,
   `dst_port`, `tcp_seq`, `udp_payload_len`) are stored in network byte order.
@@ -114,8 +114,137 @@ Defined in `xdp_mirror-common`:
 - `xdp_mirror/src/sniffer.rs` — AF_PACKET TX + RingBuf drain + edge-case
   response crafter
 
-## 12. Deferred TODOs (Future Work)
+## 12. ICMP Error Simulation (ebpf/both modes)
+
+The eBPF program can generate ICMP error responses for UDP misses at line rate,
+extending the binary "mirror or drop" decision to a three-way choice:
+
+- **Mirror**: UDP reply (swap src/dst, `XDP_TX`).
+- **NoResponse**: silence (`XDP_DROP` for hits). Controlled by `--no-rsp-perc`.
+- **IcmpError**: craft an ICMP error packet (`XDP_TX`). Controlled by
+  `--icmp-error`.
+
+### `--icmp-error <type>` flag
+
+Selects the ICMP error type for UDP misses. Default: `none` (no ICMP errors).
+
+| Name | Code | IPv4 type/code | IPv6 type/code | Meaning |
+|------|------|---------------|----------------|---------|
+| `none` | 0 | — | — | No ICMP errors (current behavior) |
+| `port-unreach` | 1 | 3/3 | 1/4 | No service bound (closed) |
+| `admin-prohibited` | 2 | 3/13 | 1/1 | Firewall rejected (filtered) |
+| `host-unreach` | 3 | 3/1 | 1/3 | Router can't reach host |
+| `net-unreach` | 4 | 3/0 | 1/0 | Router can't reach network |
+| `time-exceeded` | 5 | 11/0 | 3/0 | TTL expired in transit |
+| `all` | 6 | round-robin | round-robin | Cycle through all 5 types |
+
+`--icmp-error` applies to **UDP only**. TCP misses → Drop (RST is TCP's closed
+signal). ICMP misses → Drop (silence).
+
+### `--no-rsp-perc N` flag
+
+Percentage of hits (0-100) that get no response (silence) instead of a UDP
+reply. Default: 0 (all hits get response, current behavior). Applies to **all
+protocols**. In valm mode, the split is deterministic per-IP:
+- IPv4: `u32::from_be(dst_addr) % 100 < no_rsp_perc`
+- IPv6: `dst_addr[14] % 100 < no_rsp_perc` (byte 14, not 15, to avoid
+  correlation with the even/odd check on byte 15)
+
+### `decide()` three-way logic
+
+`decide(config, dst_ip_even, no_rsp, is_udp) -> Action` returns one of:
+`Mirror`, `NoResponse`, `IcmpError`, `PushRing`, `Drop`.
+
+- **`ebpf` mode**: hit → Mirror or NoResponse (based on `no_rsp`); miss →
+  IcmpError (if `is_udp && icmp_error_type != 0`) or Drop.
+- **`both` mode**: even-IP → Mirror or NoResponse; odd-IP → IcmpError (if UDP)
+  or PushRing.
+- **`raw` mode**: PushRing for all (sniffer handles responses; `--closed` for
+  ICMP in raw mode).
+
+### `icmp_error_tx` Stats field
+
+Per-CPU counter serving double duty:
+- For `--icmp-error all`: round-robin index (read-and-increment per CPU in
+  `icmp_type_code()`).
+- For all types: count of ICMP errors sent (incremented in the handler for
+  non-round-robin types, in `icmp_type_code()` for round-robin).
+
+### ICMP error packet structure
+
+- **IPv4** (70 bytes): Eth(14) + IP4(20, proto=1, tot_len=56) + ICMP(8) +
+  Orig IP4(20) + Orig UDP(8). Source = target IP, dest = scanner IP.
+- **IPv6** (110 bytes): Eth(14) + IP6(40, nh=58, plen=56) + ICMPv6(8) +
+  Orig IP6(40) + Orig UDP(8). Source = target IP, dest = scanner IP.
+
+All ICMP errors use the target IP as source (not a router IP). This is a known
+limitation; the scanner ignores ICMP error responses anyway.
+
+### Sniffer `--closed` flag
+
+The sniffer's `--closed` flag remains independent for `raw`/`both` edge cases.
+It sends ICMP Port Unreachable via AF_PACKET (userspace, ~100K-500K pps). The
+new `--icmp-error` flag is eBPF-generated (line rate) for `ebpf`/`both` modes.
+
+## 13. eBPF Verifier: `.text.unlikely.` Section Bug
+
+### Problem
+
+The kernel eBPF verifier rejected the program with "last insn is not an exit or
+jmp / processed 0 insns". This was caused by a `.text.unlikely.` section in the
+eBPF binary containing `panic_bounds_check` and `panic_fmt` — cold-path panic
+handlers that LLVM places in a separate section.
+
+bpf-linker creates BTF `func_info` entries for functions in `.text.unlikely.`
+(because they have DWARF debug info) but does not register them as subprograms,
+causing a `func_info_cnt != subprog_cnt` mismatch. The kernel verifier rejects
+the program before processing a single instruction.
+
+### Root Cause
+
+Runtime-indexed array access on fixed-size arrays generates a bounds check. The
+bounds check's failure path (`panic_bounds_check` → `panic_fmt`) is marked cold
+by LLVM and placed in `.text.unlikely.`.
+
+The specific trigger was `icmp_type_code()`:
+
+```rust
+// BAD: runtime idx → panic_bounds_check in .text.unlikely.
+ICMP_V4_ERRORS[idx]
+```
+
+### Fix
+
+Replace runtime array indexing with a `match` on the index. Constant-index
+array access in each match arm is compile-time folded by LLVM — no bounds check,
+no `.text.unlikely.` section:
+
+```rust
+let (v4, v6) = match idx {
+    0 => (ICMP_V4_ERRORS[0], ICMP_V6_ERRORS[0]),
+    1 => (ICMP_V4_ERRORS[1], ICMP_V6_ERRORS[1]),
+    // ...
+};
+```
+
+### What is NOT the problem
+
+- **memset/memcpy relocations** are normal and accepted by the verifier. The
+  working SYN-Rust binary also has 12 memset relocations. They are NOT the cause.
+- **Toolchain version** is irrelevant — the issue reproduces on default nightly.
+- **Global `debug = 2`** is not needed — the package-scoped
+  `[profile.release.package.xdp_mirror-ebpf] debug = 2` is sufficient.
+
+### Verification
+
+After the fix, the eBPF binary has no `.text.unlikely.` section and no panic
+symbols. Verify with:
+```sh
+llvm-objdump --section-headers <ebpf-binary> | grep text.unlikely
+```
+
+## 14. Deferred TODOs (Future Work)
 
 - Malformed/corrupt responses.
-- ICMP Dest-Unreachable / Time-Exceeded + unsolicited flood.
+- Router-spoofed source IPs for ICMP errors (currently target IP).
 - UDP payload variants.

@@ -9,6 +9,8 @@
 #   --delay MS                  (sniffer: delay before responding, ms)
 #   --fake-ip IP                (sniffer: fake source IP)
 #   --closed                    (sniffer: simulate closed port/host)
+#   --icmp-error <type>         (ebpf/both: ICMP error type for UDP misses; default: none)
+#   --no-rsp-perc N             (0-100: % of hits that get no response; default: 0)
 
 IFACE=${1:-eno1}
 shift 2>/dev/null || true
