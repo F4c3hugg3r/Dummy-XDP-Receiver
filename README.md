@@ -9,17 +9,6 @@
 1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
 1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
 
-## Build & Run
-
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
-
-```shell
-cargo run --release
-```
-
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
-
 ## Modes & Protocols
 
 DummyReceiver has three mutually-exclusive modes, selected via `--mode`:
@@ -49,6 +38,17 @@ The userspace sniffer supports edge-case behavior:
 - `--delay MS` — delay MS milliseconds before responding
 - `--fake-ip IP` — use a fake source IP (tests scanner forgery defense)
 - `--closed` — simulate a closed port/host (TCP RST / UDP ICMP Port-Unreach / ICMP silence)
+
+### ICMP error simulation (ebpf/both modes)
+
+- `--icmp-error <type>` — send ICMP errors for UDP misses instead of dropping
+  silently. Types: `port-unreach`, `admin-prohibited`, `host-unreach`,
+  `net-unreach`, `time-exceeded`, `all` (round-robin). Default: `none`.
+- `--no-rsp-perc N` — percentage of hits that get no response (silence) instead
+  of a UDP reply. In valm mode, the split is deterministic per-IP. Default: 0.
+
+See `docs/ICMP-ERROR-SIMULATION.md` for detailed usage and the full decision
+matrix.
 
 ### Usage examples
 
@@ -82,6 +82,17 @@ Both mode:
 
 ```shell
 ./run.sh eth0 50 --mode both
+```
+
+ICMP error simulation:
+
+```shell
+./run.sh eth0 50 --valm --icmp-error port-unreach
+./run.sh eth0 50 --valm --icmp-error all
+./run.sh eth0 50 --valm --no-rsp-perc 50
+./run.sh eth0 50 --valm --icmp-error all --no-rsp-perc 50
+./run.sh eth0 50 --mode both --icmp-error port-unreach
+./run.sh eth0 50 --ipv6 --valm --icmp-error port-unreach
 ```
 
 ## Cross-compiling on macOS

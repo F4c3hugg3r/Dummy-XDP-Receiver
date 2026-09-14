@@ -7,10 +7,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
 use log::debug;
+use nix::net::if_;
 use tokio::{signal, sync::watch};
 
 use sniffer::{SnifferConfig, SnifferStats};
@@ -37,6 +38,10 @@ struct Opt {
     fake_ip: Option<String>,
     #[clap(long)]
     closed: bool,
+    #[clap(long, default_value = "none")]
+    icmp_error: String,
+    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u32).range(0..=100))]
+    no_rsp_perc: u32,
 }
 
 #[tokio::main]
@@ -92,7 +97,29 @@ async fn main() -> anyhow::Result<()> {
         delay,
         fake_ip,
         closed,
+        icmp_error,
+        no_rsp_perc,
     } = opt;
+
+    // Resolve numeric interface index to name (e.g. "5" → "eno1").
+    // aya's attach() expects the interface name string, not an index.
+    let iface = if let Ok(idx) = iface.parse::<u32>() {
+        match if_::if_indextoname(idx as u32) {
+            Ok(name) => name.to_string_lossy().into_owned(),
+            Err(_) => {
+                let mut msg = format!("unknown network interface index {idx}");
+                if let Ok(interfaces) = if_::if_nameindex() {
+                    let names: Vec<String> = interfaces.iter().map(|i| i.name().to_string_lossy().into_owned()).collect();
+                    if !names.is_empty() {
+                        msg = format!("{msg}. Available interfaces: {}", names.join(", "));
+                    }
+                }
+                return Err(anyhow!(msg));
+            }
+        }
+    } else {
+        iface
+    };
 
     let mode_code = match mode.as_str() {
         "ebpf" => 0,
@@ -109,6 +136,17 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("invalid protocol: {}", protocol),
     };
 
+    let icmp_error_code = match icmp_error.as_str() {
+        "none" => 0,
+        "port-unreach" => 1,
+        "admin-prohibited" => 2,
+        "host-unreach" => 3,
+        "net-unreach" => 4,
+        "time-exceeded" => 5,
+        "all" => 6,
+        _ => anyhow::bail!("invalid icmp-error type: {}", icmp_error),
+    };
+
     let mut config_map: aya::maps::Array<_, xdp_mirror_common::Config> =
         aya::maps::Array::try_from(
             ebpf.map_mut("CONFIG").context("CONFIG map not found")?
@@ -121,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
             ipv6: ipv6 as u32,
             protocol: protocol_code,
             mode: mode_code,
+            icmp_error_type: icmp_error_code,
+            no_rsp_perc,
         },
         0,
     )?;
@@ -130,8 +170,11 @@ async fn main() -> anyhow::Result<()> {
         .context("xdp_mirror program not found")?
         .try_into()?;
     program.load()?;
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    if let Err(e) = program.attach(&iface, XdpFlags::default()) {
+        eprintln!("XDP native mode failed ({e}), falling back to SKB_MODE...");
+        program.attach(&iface, XdpFlags::SKB_MODE)
+            .context("failed to attach the XDP program in SKB_MODE")?;
+    }
 
     let needs_sniffer = mode == "raw" || mode == "both";
     let mut sniffer_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
@@ -214,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
     let mut total_icmp_rx = 0;
     let mut total_icmp_tx = 0;
     let mut total_ring_dropped = 0;
+    let mut total_icmp_error_tx = 0;
 
     for cpu_stats in stats.iter() {
         total_rx += cpu_stats.rx;
@@ -225,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         total_icmp_rx += cpu_stats.icmp_rx;
         total_icmp_tx += cpu_stats.icmp_tx;
         total_ring_dropped += cpu_stats.ring_dropped;
+        total_icmp_error_tx += cpu_stats.icmp_error_tx;
     }
 
     println!("=========================");
@@ -238,6 +283,9 @@ async fn main() -> anyhow::Result<()> {
     println!("UDP TX:                       {}", total_udp_tx);
     println!("ICMP RX:                      {}", total_icmp_rx);
     println!("ICMP TX:                      {}", total_icmp_tx);
+    if total_icmp_error_tx > 0 || icmp_error_code != 0 {
+        println!("ICMP error TX:               {}", total_icmp_error_tx);
+    }
     if total_ring_dropped > 0 || needs_sniffer {
         println!("Ring dropped:                 {}", total_ring_dropped);
     }
