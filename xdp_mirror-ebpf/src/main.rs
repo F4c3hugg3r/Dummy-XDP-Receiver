@@ -267,10 +267,6 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, u32> {
 }
 
 fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
-    if let Some(stats) = STATS.get_ptr_mut(0) {
-        unsafe { (*stats).rx += 1 };
-    }
-
     let config = if let Some(config) = CONFIG.get(0) {
         *config
     } else {
@@ -298,6 +294,12 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
         if !proto_matches(config.protocol, ip_proto, true) {
             return Ok(xdp_action::XDP_PASS);
         }
+        // rx counts only scanned-protocol packets (post proto check): the
+        // validator asserts probe_coverage == rx / |probes| within ±5 %, so
+        // ARP/other-protocol/management noise must not inflate rx.
+        if let Some(stats) = STATS.get_ptr_mut(0) {
+            unsafe { (*stats).rx += 1 };
+        }
         return match ip_proto {
             IPPROTO_TCP => handle_tcp_v6(&ctx, ipv6_hdr, src_mac, dst_mac, &config),
             IPPROTO_UDP => handle_udp_v6(&ctx, ipv6_hdr, src_mac, dst_mac, &config),
@@ -307,9 +309,27 @@ fn try_xdp_mirror(ctx: XdpContext) -> Result<u32, u32> {
     }
 
     let ipv4_hdr: *const Ipv4Hdr = ptr_at(&ctx, mem::size_of::<EthHdr>())?;
+    // Management exemption (before ANY stats accounting): traffic addressed
+    // to the receiver's own IP is the SSH control path — it must reach the
+    // kernel even while the program is attached, otherwise stop/stats/status
+    // black-hole during tcp/ebpf tests and the receiver becomes unmanageable
+    // via SSH. mgmt_ip is host byte order (0 = disabled). No IPv6
+    // exemption: the rig is IPv4.
+    if config.mgmt_ip != 0
+        && unsafe { u32::from_be((*ipv4_hdr).dst_addr) } == config.mgmt_ip
+    {
+        return Ok(xdp_action::XDP_PASS);
+    }
     let ip_proto = unsafe { (*ipv4_hdr).proto };
     if !proto_matches(config.protocol, ip_proto, false) {
         return Ok(xdp_action::XDP_PASS);
+    }
+    // rx counts only scanned-protocol packets: the validator asserts
+    // probe_coverage == rx / |probes| within ±5 %, so ARP, other-protocol
+    // and management traffic must not inflate rx. even_rx + odd_rx == rx
+    // now holds exactly (both are bumped in the handlers below).
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).rx += 1 };
     }
     let ihl = unsafe { (*ipv4_hdr).version_ihl } & 0x0F;
     let ip_hdr_len = (ihl as usize) * 4;

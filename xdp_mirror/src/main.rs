@@ -1,7 +1,7 @@
 mod sniffer;
 
 use std::{
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     str::FromStr,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -170,6 +170,22 @@ async fn spawn_stats_poller(
     Ok(handle)
 }
 
+/// Primary IPv4 address of `iface` (None when the interface has none).
+/// Used as the management exemption IP: SSH arrives on the scanned
+/// interface's own address, which the eBPF must pass through untouched.
+fn interface_ipv4(iface: &str) -> Option<Ipv4Addr> {
+    use nix::ifaddrs::getifaddrs;
+    for ifa in getifaddrs().ok()? {
+        if ifa.interface_name != iface {
+            continue;
+        }
+        if let Some(sa) = ifa.address.as_ref().and_then(|a| a.as_sockaddr_in()) {
+            return Some(sa.ip());
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
@@ -302,6 +318,17 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config_map: aya::maps::Array<_, xdp_mirror_common::Config> =
         aya::maps::Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
+    // Management IP: the primary IPv4 of the scanned interface itself — the
+    // SSH control path arrives there, so the eBPF must pass it through
+    // untouched (see Config::mgmt_ip). No IP on the interface → exemption
+    // disabled (mgmt_ip = 0), preserving the old behavior for IP-less
+    // setups.
+    let mgmt_ip = interface_ipv4(&iface);
+    if let Some(ip) = mgmt_ip {
+        debug!("management exemption active for {ip}");
+    } else {
+        eprintln!("WARN: no IPv4 address on {iface} — management exemption disabled (mgmt_ip = 0)");
+    }
     config_map.set(
         0,
         xdp_mirror_common::Config {
@@ -312,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
             mode: mode_code,
             icmp_error_type: icmp_error_code,
             no_rsp_perc,
+            mgmt_ip: mgmt_ip.map(u32::from).unwrap_or(0),
         },
         0,
     )?;
