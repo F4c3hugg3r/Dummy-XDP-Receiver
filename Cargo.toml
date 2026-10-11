@@ -28,6 +28,8 @@ env_logger = { version = "0.11.5", default-features = false }
 libc = { version = "0.2.159", default-features = false }
 log = { version = "0.4.22", default-features = false }
 nix = { version = "0.30.1", features = ["socket", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 zerocopy = { version = "0.8", features = ["derive"] }

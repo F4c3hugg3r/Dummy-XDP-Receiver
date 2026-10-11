@@ -838,6 +838,8 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "serde",
+ "serde_json",
  "tokio",
  "xdp_mirror-common",
  "xdp_mirror-ebpf",
