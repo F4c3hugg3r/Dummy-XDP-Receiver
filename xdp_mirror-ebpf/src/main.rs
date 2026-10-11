@@ -124,9 +124,38 @@ const ICMP_V6_ERRORS: [(u8, u8); 5] = [
     (3, 0), // time-exceeded
 ];
 
+/// Per-CPU parity counters: counts a *valid probe* (past the protocol match,
+/// parsing bounds and protocol-specific validity checks) by dst-IP parity.
+/// `rx` counts every frame entering the program (including ARP and
+/// non-matching protocols), so `even_rx + odd_rx <= rx`; on a quiet test LAN
+/// the difference is negligible. Valid in all modes.
+#[inline(always)]
+fn bump_rx_parity(dst_ip_even: bool) {
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe {
+            if dst_ip_even {
+                (*stats).even_rx += 1;
+            } else {
+                (*stats).odd_rx += 1;
+            }
+        }
+    }
+}
+
+/// Counts hits suppressed by `--no-rsp-perc` (a `NoResponse` decision = a hit
+/// that got silence instead of a reply). Only ever set by the eBPF program —
+/// the sniffer has no no-rsp logic — so the counter is valid in `ebpf` and
+/// `both` modes only (in `raw` mode everything goes to the RingBuf).
+#[inline(always)]
+fn bump_no_rsp() {
+    if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).no_rsp_count += 1 };
+    }
+}
+
 #[inline(always)]
 fn decide(config: &Config, dst_ip_even: bool, no_rsp: bool, is_udp: bool) -> Action {
-    match config.mode {
+    let action = match config.mode {
         1 => Action::PushRing,
         2 => {
             if dst_ip_even {
@@ -160,7 +189,11 @@ fn decide(config: &Config, dst_ip_even: bool, no_rsp: bool, is_udp: bool) -> Act
                 Action::Drop
             }
         }
+    };
+    if matches!(action, Action::NoResponse) {
+        bump_no_rsp();
     }
+    action
 }
 
 #[inline(always)]
@@ -317,6 +350,7 @@ fn handle_tcp_v4(
     let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
     let dst_ip_even = dst_addr_be % 2 == 0;
     let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
@@ -426,6 +460,7 @@ fn handle_tcp_v6(
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
     let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
@@ -527,6 +562,7 @@ fn handle_udp_v4(
     let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
     let dst_ip_even = dst_addr_be % 2 == 0;
     let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, true) {
         Action::Mirror => {
@@ -622,6 +658,7 @@ fn handle_udp_v6(
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
     let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, true) {
         Action::Mirror => {
@@ -717,6 +754,7 @@ fn handle_icmp_v4(
     let dst_addr_be = u32::from_be(unsafe { (*ipv4_hdr).dst_addr });
     let dst_ip_even = dst_addr_be % 2 == 0;
     let no_rsp = dst_addr_be % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {
@@ -787,6 +825,7 @@ fn handle_icmp_v6(
 
     let dst_ip_even = unsafe { (*ipv6_hdr).dst_addr[15] } % 2 == 0;
     let no_rsp = unsafe { (*ipv6_hdr).dst_addr[14] } as u32 % 100 < config.no_rsp_perc;
+    bump_rx_parity(dst_ip_even);
 
     match decide(config, dst_ip_even, no_rsp, false) {
         Action::Mirror => {

@@ -74,6 +74,37 @@ IPv4: `u32::from_be(dst_addr) % 2`. IPv6: `dst_addr[15] % 2`.
 | `--fake-ip IP` | Fake source IP — tests scanner's forgery defense |
 | `--closed` | Closed-host: TCP RST / UDP ICMP Port-Unreach / ICMP silence |
 
+## 7a. Stats Output Flags (all modes)
+
+- `--stats-file <path>` (default `/tmp/xdp_mirror_stats.jsonl`) — a tokio task
+  polls the `PerCpuArray<Stats>` every 1 s, aggregates across CPUs (shared
+  `aggregate_stats` helper, also used by the Ctrl-C printer) and appends one
+  JSON line:
+  ```json
+  {"ts":<s since start>,"rx":…,"tx":…,"even_rx":…,"odd_rx":…,"udp_rx":…,"udp_tx":…,"icmp_rx":…,"icmp_tx":…,"no_rsp_count":…,"ring_dropped":…}
+  ```
+  The task stops on the same shutdown watch channel as the sniffer and
+  performs one final aggregation before exiting.
+- `--json-stats` — on Ctrl-C, print ONE JSON object instead of the German
+  human-readable text:
+  ```json
+  {"final":true,"rx":…,"valid_syn":…,"tx":…,"rst_packets":…,"udp_rx":…,"udp_tx":…,"icmp_rx":…,"icmp_tx":…,"icmp_error_tx":…,"ring_dropped":…,"even_rx":…,"odd_rx":…,"no_rsp_count":…,"sniffer":null}
+  ```
+  When the sniffer ran, `"sniffer"` is `{"sent":…,"closed_sent":…,"fake_sent":…,"dropped_ring":…}`;
+  otherwise `null`. Without the flag the German text output is kept
+  (backward compat). The test-suite orchestrator always passes `--json-stats`.
+
+### Counter validity by mode
+
+| Counter | ebpf | raw | both |
+|---------|------|-----|------|
+| `rx`, `valid_syn`, `udp_rx`, `icmp_rx` | ✓ | ✓ | ✓ |
+| `tx`, `udp_tx`, `icmp_tx` | ✓ | 0 (sniffer counts in `SnifferStats.sent`) | even-IP only |
+| `even_rx`, `odd_rx` | ✓ | ✓ | ✓ |
+| `no_rsp_count` | ✓ | 0 (no no-rsp logic in sniffer) | ✓ |
+| `ring_dropped` | ✓ | ✓ | ✓ (eBPF side; sniffer drops count in `SnifferStats.dropped_ring`) |
+| `icmp_error_tx` | ✓ | 0 | ✓ (odd-IP UDP errors) |
+
 ## 8. Known Scanner Quirk
 
 ICMPv6 type-129 request bug in
@@ -98,8 +129,22 @@ Defined in `xdp_mirror-common`:
 
 - **`Config`** (7 `u32` fields): `response_probability`, `validation_mode`,
   `ipv6`, `protocol`, `mode`, `icmp_error_type`, `no_rsp_perc`.
-- **`Stats`** (10 `u64` counters): `rx`, `valid_syn`, `tx`, `rst_packets`,
-  `udp_rx`, `udp_tx`, `icmp_rx`, `icmp_tx`, `ring_dropped`, `icmp_error_tx`.
+- **`Stats`** (13 `u64` counters, `#[repr(C)]` shared with eBPF):
+  `rx`, `valid_syn`, `tx`, `rst_packets`, `udp_rx`, `udp_tx`, `icmp_rx`,
+  `icmp_tx`, `ring_dropped`, `icmp_error_tx`, plus:
+  - `even_rx` — valid probes with an even dst IP (hit candidates in valm).
+    Incremented in the eBPF handlers (all modes) right after the
+    protocol-specific validity checks, via `bump_rx_parity(dst_ip_even)`.
+  - `odd_rx` — valid probes with an odd dst IP (misses in valm). Same
+    increment site as `even_rx`.
+  - `no_rsp_count` — hits suppressed by `--no-rsp-perc` (a `NoResponse`
+    decision). Incremented in `decide()` — i.e. **eBPF only**, so the counter
+    is valid in `ebpf` and `both` modes; in `raw` mode everything goes to the
+    RingBuf and the sniffer has no no-rsp logic (it stays 0).
+  - ⚠ `rx` counts **every frame** entering the program (including ARP and
+    non-matching protocols), while `even_rx`/`odd_rx` count only valid probes
+    of the selected protocol. On a quiet test LAN `even_rx + odd_rx ≈ rx`;
+    the exact invariant is `even_rx + odd_rx <= rx`.
 - **`ProbeEventHeader`**: 80-byte packed struct (`#[repr(C, packed)]`,
   `zerocopy` derives) pushed to the RingBuf. Multi-byte fields (`src_port`,
   `dst_port`, `tcp_seq`, `udp_payload_len`) are stored in network byte order.
