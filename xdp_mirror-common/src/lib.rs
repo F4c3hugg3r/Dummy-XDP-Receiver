@@ -15,6 +15,15 @@ pub struct Config {
     // 3=host-unreach, 4=net-unreach, 5=time-exceeded,
     // 6=all (round-robin)
     pub no_rsp_perc: u32, // 0-100, % of hits that get no response
+    // Management exemption (IPv4 only): packets destined to this IP (host
+    // byte order; 0 = disabled) are passed to the kernel untouched, BEFORE
+    // any stats accounting. This keeps the SSH control path (stop/stats/
+    // status) alive while the program is attached — in tcp/ebpf mode the
+    // decision logic would otherwise drop every TCP packet to an odd dst IP
+    // and the receiver becomes unmanageable via SSH. The scan CIDR must
+    // never contain this IP (suite invariant: scan targets 10.0.0.0/12,
+    // mgmt is the LAN IP of the receiver).
+    pub mgmt_ip: u32,
 }
 
 #[cfg(feature = "user")]

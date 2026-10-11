@@ -105,6 +105,24 @@ IPv4: `u32::from_be(dst_addr) % 2`. IPv6: `dst_addr[15] % 2`.
 | `ring_dropped` | ✓ | ✓ | ✓ (eBPF side; sniffer drops count in `SnifferStats.dropped_ring`) |
 | `icmp_error_tx` | ✓ | 0 | ✓ (odd-IP UDP errors) |
 
+### Management exemption + rx semantics (Oct 2026)
+
+The eBPF passes packets destined to the receiver's OWN IPv4 (its scanned
+interface's primary address, host byte order, `Config.mgmt_ip`, 0 =
+disabled) through untouched BEFORE any stats accounting. Reason: in
+tcp/ebpf mode the decision logic drops every TCP packet to an odd dst IP —
+including the SSH control path to the receiver's own (odd) IP, making
+`stop`/`stats`/`status` impossible while attached (the receiver was left
+running on the rig; ping still worked since ICMP passes). The suite's
+invariant: the scan CIDR (10.0.0.0/12) never contains the mgmt IP.
+
+Consequence for `rx`: it is bumped only AFTER the protocol check (and after
+the mgmt exemption) — `rx` now counts exactly the scanned-protocol packets
+minus management traffic. On the old code `rx` counted every packet the NIC
+saw (ARP, SSH, other protocols). The test-suite validator asserts
+`probe_coverage == rx / |probes|` within ±5 %, so this precision is
+required. `even_rx + odd_rx == rx` now holds exactly (was ≤).
+
 ## 8. Known Scanner Quirk
 
 ICMPv6 type-129 request bug in
