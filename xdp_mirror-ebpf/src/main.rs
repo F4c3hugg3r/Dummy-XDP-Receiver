@@ -609,6 +609,13 @@ fn handle_udp_v4(
             }
 
             if let Some(stats) = STATS.get_ptr_mut(0) {
+                // Aggregate tx = the validator's cross-protocol
+                // response counter (identity: tx == even_rx -
+                // no_rsp_count); these paths previously bumped only
+                // the protocol-specific counter, so the identity
+                // failed although responses were delivered
+                // (rig-observed: tx=0 with 52,430 hits).
+                unsafe { (*stats).tx += 1 };
                 unsafe { (*stats).udp_tx += 1 };
             }
 
@@ -702,6 +709,13 @@ fn handle_udp_v6(
             }
 
             if let Some(stats) = STATS.get_ptr_mut(0) {
+                // Aggregate tx = the validator's cross-protocol
+                // response counter (identity: tx == even_rx -
+                // no_rsp_count); these paths previously bumped only
+                // the protocol-specific counter, so the identity
+                // failed although responses were delivered
+                // (rig-observed: tx=0 with 52,430 hits).
+                unsafe { (*stats).tx += 1 };
                 unsafe { (*stats).udp_tx += 1 };
             }
 
@@ -801,6 +815,13 @@ fn handle_icmp_v4(
             }
 
             if let Some(stats) = STATS.get_ptr_mut(0) {
+                // Aggregate tx = the validator's cross-protocol
+                // response counter (identity: tx == even_rx -
+                // no_rsp_count); these paths previously bumped only
+                // the protocol-specific counter, so the identity
+                // failed although responses were delivered
+                // (rig-observed: tx=0 with 52,430 hits).
+                unsafe { (*stats).tx += 1 };
                 unsafe { (*stats).icmp_tx += 1 };
             }
 
@@ -871,6 +892,13 @@ fn handle_icmp_v6(
             }
 
             if let Some(stats) = STATS.get_ptr_mut(0) {
+                // Aggregate tx = the validator's cross-protocol
+                // response counter (identity: tx == even_rx -
+                // no_rsp_count); these paths previously bumped only
+                // the protocol-specific counter, so the identity
+                // failed although responses were delivered
+                // (rig-observed: tx=0 with 52,430 hits).
+                unsafe { (*stats).tx += 1 };
                 unsafe { (*stats).icmp_tx += 1 };
             }
 
