@@ -17,6 +17,7 @@ const HDR_SIZE: usize = std::mem::size_of::<ProbeEventHeader>();
 
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SEQ_BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static FAKE_ROTATE: AtomicU64 = AtomicU64::new(0);
 
 fn next_isn() -> u32 {
     let base = *SEQ_BASE.get_or_init(|| {
@@ -29,12 +30,24 @@ fn next_isn() -> u32 {
     base.wrapping_add(n) as u32
 }
 
+#[derive(Clone, Copy)]
+pub struct FakeIpEntry {
+    pub bytes: [u8; 16],
+    pub v6: bool,
+}
+
 pub struct SnifferConfig {
     pub count: u32,
     pub delay: u64,
     pub fake_ip: Option<[u8; 16]>,
     pub fake_ipv6: bool,
     pub closed: bool,
+    pub tcp_flags: u8,
+    pub bad_csum: bool,
+    pub ack_delta: u32,
+    pub port_override: Option<u16>,
+    pub fake_ip_list: Vec<FakeIpEntry>,
+    pub fragment: bool,
 }
 
 #[derive(Default)]
@@ -42,6 +55,7 @@ pub struct SnifferStats {
     pub sent: AtomicU64,
     pub closed_sent: AtomicU64,
     pub fake_sent: AtomicU64,
+    pub frag_sent: AtomicU64,
     pub dropped_ring: AtomicU64,
 }
 
@@ -277,10 +291,34 @@ fn icmp_v6_csum(src_ip: &[u8], dst_ip: &[u8], icmp_data: &[u8]) -> u16 {
 }
 
 fn fake_applies(config: &SnifferConfig, version: u8) -> bool {
-    config.fake_ip.is_some() && config.fake_ipv6 == (version == 6)
+    let v6 = version == 6;
+    if !config.fake_ip_list.is_empty() {
+        return config.fake_ip_list.iter().any(|e| e.v6 == v6);
+    }
+    config.fake_ip.is_some() && config.fake_ipv6 == v6
+}
+
+/// Rotating forged-source pool: picks the next pool entry matching the
+/// probe's IP version (round-robin, one step per response). Entries with a
+/// mismatched version are skipped; a pool without any matching entry yields
+/// None (real destination IP).
+fn pick_fake(config: &SnifferConfig, v6: bool) -> Option<[u8; 16]> {
+    let matching: Vec<&FakeIpEntry> = config
+        .fake_ip_list
+        .iter()
+        .filter(|e| e.v6 == v6)
+        .collect();
+    if matching.is_empty() {
+        return None;
+    }
+    let idx = FAKE_ROTATE.fetch_add(1, Ordering::Relaxed) as usize;
+    Some(matching[idx % matching.len()].bytes)
 }
 
 fn src_ip_v4(hdr: &ProbeEventHeader, config: &SnifferConfig) -> [u8; 4] {
+    if let Some(fake) = pick_fake(config, false) {
+        return [fake[0], fake[1], fake[2], fake[3]];
+    }
     match &config.fake_ip {
         Some(fake) if !config.fake_ipv6 => [fake[0], fake[1], fake[2], fake[3]],
         _ => [hdr.dst_ip[0], hdr.dst_ip[1], hdr.dst_ip[2], hdr.dst_ip[3]],
@@ -288,9 +326,23 @@ fn src_ip_v4(hdr: &ProbeEventHeader, config: &SnifferConfig) -> [u8; 4] {
 }
 
 fn src_ip_v6(hdr: &ProbeEventHeader, config: &SnifferConfig) -> [u8; 16] {
+    if let Some(fake) = pick_fake(config, true) {
+        return fake;
+    }
     match &config.fake_ip {
         Some(fake) if config.fake_ipv6 => *fake,
         _ => hdr.dst_ip,
+    }
+}
+
+/// Flips one bit of a computed transport checksum. Falls back to a second
+/// bit when the flip would produce 0x0000 (UDP treats that as "no checksum").
+fn corrupt_csum(csum: u16) -> u16 {
+    let bad = csum ^ 0x0001;
+    if bad == 0 {
+        csum ^ 0x0002
+    } else {
+        bad
     }
 }
 
@@ -311,17 +363,20 @@ fn craft_tcp_syn_ack_v4(hdr: &ProbeEventHeader, config: &SnifferConfig) -> Vec<u
     let ip_csum = ipv4_csum(&frame[14..34]);
     put_u16(&mut frame, 24, ip_csum);
 
-    put_u16(&mut frame, 34, u16::from_be(hdr.dst_port));
+    match config.port_override {
+        Some(p) => put_u16(&mut frame, 34, p),
+        None => put_u16(&mut frame, 34, u16::from_be(hdr.dst_port)),
+    }
     put_u16(&mut frame, 36, u16::from_be(hdr.src_port));
     let seq = next_isn();
     put_u32(&mut frame, 38, seq);
-    let ack = u32::from_be(hdr.tcp_seq).wrapping_add(1);
+    let ack = u32::from_be(hdr.tcp_seq).wrapping_add(config.ack_delta);
     put_u32(&mut frame, 42, ack);
     frame[46] = 0x50;
-    frame[47] = 0x12;
+    frame[47] = config.tcp_flags;
     put_u16(&mut frame, 48, 64240);
     let tcp_csum = tcp_csum_v4(&src_ip, &hdr.src_ip[..4], &frame[34..54]);
-    put_u16(&mut frame, 50, tcp_csum);
+    put_u16(&mut frame, 50, if config.bad_csum { corrupt_csum(tcp_csum) } else { tcp_csum });
 
     frame
 }
@@ -341,17 +396,20 @@ fn craft_tcp_syn_ack_v6(hdr: &ProbeEventHeader, config: &SnifferConfig) -> Vec<u
     frame[22..38].copy_from_slice(&src_ip);
     frame[38..54].copy_from_slice(&hdr.src_ip[..16]);
 
-    put_u16(&mut frame, 54, u16::from_be(hdr.dst_port));
+    match config.port_override {
+        Some(p) => put_u16(&mut frame, 54, p),
+        None => put_u16(&mut frame, 54, u16::from_be(hdr.dst_port)),
+    }
     put_u16(&mut frame, 56, u16::from_be(hdr.src_port));
     let seq = next_isn();
     put_u32(&mut frame, 58, seq);
-    let ack = u32::from_be(hdr.tcp_seq).wrapping_add(1);
+    let ack = u32::from_be(hdr.tcp_seq).wrapping_add(config.ack_delta);
     put_u32(&mut frame, 62, ack);
     frame[66] = 0x50;
-    frame[67] = 0x12;
+    frame[67] = config.tcp_flags;
     put_u16(&mut frame, 68, 64240);
     let tcp_csum = tcp_csum_v6(&src_ip, &hdr.src_ip[..16], &frame[54..74]);
-    put_u16(&mut frame, 70, tcp_csum);
+    put_u16(&mut frame, 70, if config.bad_csum { corrupt_csum(tcp_csum) } else { tcp_csum });
 
     frame
 }
@@ -376,7 +434,10 @@ fn craft_udp_echo_v4(hdr: &ProbeEventHeader, payload: &[u8], config: &SnifferCon
     put_u16(&mut frame, 24, ip_csum);
 
     let udp_start = 34;
-    put_u16(&mut frame, udp_start, u16::from_be(hdr.dst_port));
+    match config.port_override {
+        Some(p) => put_u16(&mut frame, udp_start, p),
+        None => put_u16(&mut frame, udp_start, u16::from_be(hdr.dst_port)),
+    }
     put_u16(&mut frame, udp_start + 2, u16::from_be(hdr.src_port));
     let udp_len = (8 + payload_len) as u16;
     put_u16(&mut frame, udp_start + 4, udp_len);
@@ -388,7 +449,11 @@ fn craft_udp_echo_v4(hdr: &ProbeEventHeader, payload: &[u8], config: &SnifferCon
         &hdr.src_ip[..4],
         &frame[udp_start..udp_start + 8 + payload_len],
     );
-    put_u16(&mut frame, udp_start + 6, udp_csum);
+    put_u16(
+        &mut frame,
+        udp_start + 6,
+        if config.bad_csum { corrupt_csum(udp_csum) } else { udp_csum },
+    );
 
     frame
 }
@@ -411,7 +476,10 @@ fn craft_udp_echo_v6(hdr: &ProbeEventHeader, payload: &[u8], config: &SnifferCon
     frame[38..54].copy_from_slice(&hdr.src_ip[..16]);
 
     let udp_start = 54;
-    put_u16(&mut frame, udp_start, u16::from_be(hdr.dst_port));
+    match config.port_override {
+        Some(p) => put_u16(&mut frame, udp_start, p),
+        None => put_u16(&mut frame, udp_start, u16::from_be(hdr.dst_port)),
+    }
     put_u16(&mut frame, udp_start + 2, u16::from_be(hdr.src_port));
     let udp_len = (8 + payload_len) as u16;
     put_u16(&mut frame, udp_start + 4, udp_len);
@@ -423,7 +491,11 @@ fn craft_udp_echo_v6(hdr: &ProbeEventHeader, payload: &[u8], config: &SnifferCon
         &hdr.src_ip[..16],
         &frame[udp_start..udp_start + 8 + payload_len],
     );
-    put_u16(&mut frame, udp_start + 6, udp_csum);
+    put_u16(
+        &mut frame,
+        udp_start + 6,
+        if config.bad_csum { corrupt_csum(udp_csum) } else { udp_csum },
+    );
 
     frame
 }
@@ -452,7 +524,11 @@ fn craft_icmp_reply_v4(hdr: &ProbeEventHeader, config: &SnifferConfig) -> Vec<u8
     frame[icmp_start + 6..icmp_start + 8].copy_from_slice(&hdr.icmp_seq);
     frame[icmp_start + 8..icmp_start + 24].copy_from_slice(&hdr.icmp_payload);
     let icmp_csum = icmp_v4_csum(&frame[icmp_start..icmp_start + 24]);
-    put_u16(&mut frame, icmp_start + 2, icmp_csum);
+    put_u16(
+        &mut frame,
+        icmp_start + 2,
+        if config.bad_csum { corrupt_csum(icmp_csum) } else { icmp_csum },
+    );
 
     frame
 }
@@ -483,7 +559,11 @@ fn craft_icmp_reply_v6(hdr: &ProbeEventHeader, config: &SnifferConfig) -> Vec<u8
         &hdr.src_ip[..16],
         &frame[icmp_start..icmp_start + 24],
     );
-    put_u16(&mut frame, icmp_start + 2, icmp_csum);
+    put_u16(
+        &mut frame,
+        icmp_start + 2,
+        if config.bad_csum { corrupt_csum(icmp_csum) } else { icmp_csum },
+    );
 
     frame
 }
@@ -586,6 +666,37 @@ fn craft_icmp_unreach_v4(hdr: &ProbeEventHeader) -> Vec<u8> {
     frame
 }
 
+/// Splits an assembled IPv4 response into two IP fragments after the first
+/// 8 transport bytes (frame offset 42 = Ethernet + IP header + 8 transport
+/// bytes): fragment 1 carries MF=1 with tot_len=28, fragment 2 carries the
+/// remainder with frag_offset=1 (8-byte units). Each fragment's IP checksum
+/// is recomputed; the IP ID stays shared (0). Frames with nothing after the
+/// split point are returned unfragmented.
+fn fragment_frame(frame: &[u8]) -> Vec<Vec<u8>> {
+    if frame.len() <= 42 {
+        return vec![frame.to_vec()];
+    }
+
+    let mut f1 = vec![0u8; 42];
+    f1[..34].copy_from_slice(&frame[..34]);
+    f1[34..42].copy_from_slice(&frame[34..42]);
+    put_u16(&mut f1, 16, 28);
+    put_u16(&mut f1, 20, 0x2000);
+    let c1 = ipv4_csum(&f1[14..34]);
+    put_u16(&mut f1, 24, c1);
+
+    let remainder = frame.len() - 42;
+    let mut f2 = vec![0u8; 34 + remainder];
+    f2[..34].copy_from_slice(&frame[..34]);
+    f2[34..].copy_from_slice(&frame[42..]);
+    put_u16(&mut f2, 16, (20 + remainder) as u16);
+    put_u16(&mut f2, 20, 0x0001);
+    let c2 = ipv4_csum(&f2[14..34]);
+    put_u16(&mut f2, 24, c2);
+
+    vec![f1, f2]
+}
+
 fn craft_and_send_response(
     hdr: &ProbeEventHeader,
     payload: &[u8],
@@ -603,10 +714,24 @@ fn craft_and_send_response(
         (6, 58) => craft_icmp_reply_v6(hdr, config),
         _ => return,
     };
-    if send_frame(&frame, sock_fd, &hdr.src_mac, ifindex).is_ok() {
+    let frames: Vec<Vec<u8>> = if config.fragment && hdr.version == 4 {
+        fragment_frame(&frame)
+    } else {
+        vec![frame]
+    };
+    let mut all_sent = true;
+    for f in &frames {
+        if send_frame(f, sock_fd, &hdr.src_mac, ifindex).is_err() {
+            all_sent = false;
+        }
+    }
+    if all_sent {
         stats.sent.fetch_add(1, Ordering::Relaxed);
         if fake_applies(config, hdr.version) {
             stats.fake_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        if frames.len() > 1 {
+            stats.frag_sent.fetch_add(frames.len() as u64, Ordering::Relaxed);
         }
     }
 }

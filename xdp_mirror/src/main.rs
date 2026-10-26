@@ -15,7 +15,17 @@ use nix::net::if_;
 use serde::Serialize;
 use tokio::{signal, sync::watch};
 
-use sniffer::{SnifferConfig, SnifferStats};
+use sniffer::{FakeIpEntry, SnifferConfig, SnifferStats};
+
+/// Accepts hex ("0x02") or decimal ("2") byte values.
+fn parse_u8_maybe_hex(s: &str) -> Result<u8, String> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        t.parse::<u8>().map_err(|e| e.to_string())
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -37,6 +47,18 @@ struct Opt {
     delay: u64,
     #[clap(long)]
     fake_ip: Option<String>,
+    #[clap(long, conflicts_with = "fake_ip")]
+    fake_ip_list: Option<String>,
+    #[clap(long, value_parser = parse_u8_maybe_hex, default_value = "0x12")]
+    tcp_flags: u8,
+    #[clap(long)]
+    bad_csum: bool,
+    #[clap(long, default_value = "1")]
+    ack_delta: u32,
+    #[clap(long)]
+    port_override: Option<u16>,
+    #[clap(long)]
+    fragment: bool,
     #[clap(long)]
     closed: bool,
     #[clap(long, default_value = "none")]
@@ -100,6 +122,7 @@ struct SnifferStatsJson {
     sent: u64,
     closed_sent: u64,
     fake_sent: u64,
+    frag_sent: u64,
     dropped_ring: u64,
 }
 
@@ -108,6 +131,7 @@ fn sniffer_stats_json(stats: &Option<Arc<SnifferStats>>) -> Option<SnifferStatsJ
         sent: s.sent.load(Ordering::Relaxed),
         closed_sent: s.closed_sent.load(Ordering::Relaxed),
         fake_sent: s.fake_sent.load(Ordering::Relaxed),
+        frag_sent: s.frag_sent.load(Ordering::Relaxed),
         dropped_ring: s.dropped_ring.load(Ordering::Relaxed),
     })
 }
@@ -260,6 +284,12 @@ async fn main() -> anyhow::Result<()> {
         count,
         delay,
         fake_ip,
+        fake_ip_list,
+        tcp_flags,
+        bad_csum,
+        ack_delta,
+        port_override,
+        fragment,
         closed,
         icmp_error,
         no_rsp_perc,
@@ -382,12 +412,48 @@ async fn main() -> anyhow::Result<()> {
             None => (None, false),
         };
 
+        let fake_ip_pool: Vec<FakeIpEntry> = match fake_ip_list.as_deref() {
+            Some(list) => {
+                let mut pool = Vec::new();
+                for entry in list.split(',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let ip: IpAddr = IpAddr::from_str(entry)
+                        .with_context(|| format!("failed to parse fake-ip-list entry '{entry}'"))?;
+                    match ip {
+                        IpAddr::V4(v4) => {
+                            let mut bytes = [0u8; 16];
+                            bytes[..4].copy_from_slice(&v4.octets());
+                            pool.push(FakeIpEntry { bytes, v6: false });
+                        }
+                        IpAddr::V6(v6) => pool.push(FakeIpEntry {
+                            bytes: v6.octets(),
+                            v6: true,
+                        }),
+                    }
+                }
+                if pool.is_empty() {
+                    anyhow::bail!("--fake-ip-list contains no parsable IP");
+                }
+                pool
+            }
+            None => Vec::new(),
+        };
+
         let sniffer_config = SnifferConfig {
             count,
             delay,
             fake_ip: fake_ip_bytes,
             fake_ipv6,
             closed,
+            tcp_flags,
+            bad_csum,
+            ack_delta,
+            port_override,
+            fake_ip_list: fake_ip_pool,
+            fragment,
         };
         let stats = Arc::new(SnifferStats::default());
 
@@ -510,6 +576,12 @@ async fn main() -> anyhow::Result<()> {
             "Sniffer fake_sent:            {}",
             sniffer_st.fake_sent.load(Ordering::Relaxed)
         );
+        if sniffer_st.frag_sent.load(Ordering::Relaxed) > 0 {
+            println!(
+                "Sniffer frag_sent:            {}",
+                sniffer_st.frag_sent.load(Ordering::Relaxed)
+            );
+        }
         println!(
             "Sniffer dropped_ring:         {}",
             sniffer_st.dropped_ring.load(Ordering::Relaxed)

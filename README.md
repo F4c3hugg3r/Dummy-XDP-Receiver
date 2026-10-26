@@ -39,6 +39,24 @@ The userspace sniffer supports edge-case behavior:
 - `--fake-ip IP` — use a fake source IP (tests scanner forgery defense)
 - `--closed` — simulate a closed port/host (TCP RST / UDP ICMP Port-Unreach / ICMP silence)
 
+### Hostile-mode flags (raw mode)
+
+Each flag attacks one scanner validation gate. All are raw-sniffer features;
+the eBPF path is unaffected. They are orthogonal and compose.
+
+| Flag | Semantics | Attacked gate | Rig test |
+|------|-----------|---------------|----------|
+| `--tcp-flags VAL` | TCP flags byte in SYN-ACK replies (hex `0x02` or decimal, default `0x12`) | response flag validation | `edge_bad_flags` |
+| `--bad-csum` | corrupts the transport checksum of TCP/UDP/ICMP replies (IP header stays valid) | transport checksum validation | `edge_bad_csum` |
+| `--ack-delta N` | SYN-ACK ack = probe seq + N (default 1 = correct cookie) | cookie/ack validation | `edge_wrong_ack` |
+| `--port-override PORT` | reply SOURCE port = PORT instead of the probed port | port identity check | `edge_port_override` |
+| `--fake-ip-list a,b,c` | rotating forged source pool (round-robin per reply, counts into `fake_sent`); supersedes `--fake-ip` (conflict error if both given); pool entries of a mismatching IP version are skipped — a v6 probe with a v4-only pool gets the real source | source-IP validation (TCP cookie binding) | `edge_reflection` |
+| `--fragment` | split IPv4 replies into two IP fragments after the first 8 transport bytes (MF=1 / frag_offset=1, per-fragment IP checksum); IPv6 replies stay unfragmented | fragmented-response handling | `edge_fragmented` |
+
+Known limitations (documented, specs are IPv4): a forged pool without any
+entry matching the probe's IP version falls back to the real source IP;
+`--fragment` only applies to IPv4.
+
 ### ICMP error simulation (ebpf/both modes)
 
 - `--icmp-error <type>` — send ICMP errors for UDP misses instead of dropping
@@ -76,6 +94,12 @@ Raw mode edge cases:
 ```shell
 ./run.sh eth0 50 --mode raw --count 3
 ./run.sh eth0 50 --mode raw --closed
+./run.sh eth0 50 --mode raw --tcp-flags 0x02
+./run.sh eth0 50 --mode raw --bad-csum
+./run.sh eth0 50 --mode raw --ack-delta 2
+./run.sh eth0 50 --mode raw --port-override 9999
+./run.sh eth0 50 --mode raw --fake-ip-list 10.99.99.1,10.99.99.2,10.99.99.3
+./run.sh eth0 50 --mode raw --fragment
 ```
 
 Both mode:
