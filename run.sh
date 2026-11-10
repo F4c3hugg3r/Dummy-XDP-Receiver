@@ -11,6 +11,12 @@
 #   --closed                    (sniffer: simulate closed port/host)
 #   --icmp-error <type>         (ebpf/both: ICMP error type for UDP misses; default: none)
 #   --no-rsp-perc N             (0-100: % of hits that get no response; default: 0)
+#   --raw-filter                (raw: only valm hits go to the sniffer; needs --valm)
+#   --rto-profile P             (sniffer: linux|bsd|windows|internet retransmits)
+#   --loss-perc P               (sniffer: % loss per retransmit/delayed copy, float)
+#   --jitter-ms J               (sniffer: uniform [0,J] ms extra delay per delayed copy)
+#   --max-pending N             (sniffer: delayed-copy queue capacity, default 2000000)
+#   --seed S                    (sniffer: PRNG seed for loss/jitter)
 
 IFACE=${1:-eno1}
 shift 2>/dev/null || true

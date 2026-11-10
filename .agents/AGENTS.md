@@ -52,9 +52,25 @@ scanner probe -> eBPF parse -> (mirror in-kernel via XDP_TX)
 The dummy simulates **real kernel/host behavior**, NOT scanner quirks.
 
 **Critical**: the ICMPv6 handler accepts ONLY type 128 (Echo Request) and
-IGNORES type 129 (Echo Reply). The scanner's ICMPv6 probe uses type 129 (a bug
-— should be 128), so a correctly-simulated dummy produces **zero** ICMPv6 hits,
-surfacing the scanner bug. Do NOT add a "robust" respond-to-129 shortcut.
+IGNORES type 129 (Echo Reply). This is deliberate — a real host never replies
+to an Echo Reply. The SYN-Rust scanner's former ICMPv6 request-type bug
+(probe sent type 129, `SYN-Rust/scanner/src/scan_utils/probes/icmp.rs:25`)
+was **FIXED** (current source sends `128 << 8`); the note below (§12
+history) documents the original finding. Do NOT add a "robust"
+respond-to-129 shortcut.
+
+**ICMP payload-size compatibility (verified against the scanner sources
+2026-11-02):** the eBPF mirror reads and rewrites 24-byte ICMP echo
+messages (8-byte header + 16-byte payload). The SYN-Rust scanner sends
+exactly that (16-B v4 payload; v6 = 20-byte byte_array where the leading
+4 bytes are the id/seq placeholders → 24-byte ICMP message). The Go
+scanner's IPv6 echo carries a 20-byte payload (28-byte ICMP message) —
+incompatible with the 24-byte layout; that is a Go-scanner defect (its
+own validation also expects 24 bytes), not a dummy defect
+(goscanner_bugs.md §5). In-place eBPF replies preserve the FULL incoming
+payload; the userspace sniffer path re-crafts the reply with a 16-byte
+payload (the eBPF event only carries 16 bytes) — payloads >16 B are
+truncated in raw/both mode only.
 
 ## 6. Deterministic (valm) Mode
 
@@ -123,7 +139,7 @@ saw (ARP, SSH, other protocols). The test-suite validator asserts
 `probe_coverage == rx / |probes|` within ±5 %, so this precision is
 required. `even_rx + odd_rx == rx` now holds exactly (was ≤).
 
-## 8. Known Scanner Quirk
+## 8. Known Scanner Quirk (FIXED 2026-11-02 in the scanner source)
 
 ICMPv6 type-129 request bug in
 `SYN-Rust/scanner/src/scan_utils/probes/icmp.rs:25`:
@@ -134,6 +150,9 @@ const ICMPV6_ECHO_REQUEST_TYPECODE: u16 = 129 << 8; // BUG: should be 128 << 8
 
 The dummy correctly simulates real-kernel behavior; the fix belongs in the
 scanner. A correctly-simulated dummy yields zero ICMPv6 hits.
+**Update:** the scanner source now carries the fix (`128 << 8` at the same
+line — verified 2026-11-02); this section is kept as the finding's history.
+ICMPv6 remains unasserted by the test suite (`test_spec.md` §3.17).
 
 ## 9. ARP-Drop Bug Fix
 

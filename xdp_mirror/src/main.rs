@@ -1,3 +1,4 @@
+mod schedule;
 mod sniffer;
 
 use std::{
@@ -15,6 +16,7 @@ use nix::net::if_;
 use serde::Serialize;
 use tokio::{signal, sync::watch};
 
+use schedule::{FlagCheck, RtoProfile, ScheduleConfig};
 use sniffer::{FakeIpEntry, SnifferConfig, SnifferStats};
 
 /// Accepts hex ("0x02") or decimal ("2") byte values.
@@ -25,6 +27,17 @@ fn parse_u8_maybe_hex(s: &str) -> Result<u8, String> {
     } else {
         t.parse::<u8>().map_err(|e| e.to_string())
     }
+}
+
+fn parse_max_pending(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid max-pending '{s}': {e}"))?;
+    if v == 0 {
+        return Err("max-pending must be >= 1".into());
+    }
+    Ok(v)
 }
 
 #[derive(Debug, Parser)]
@@ -41,10 +54,51 @@ struct Opt {
     mode: String,
     #[clap(long, default_value = "any")]
     protocol: String,
+    /// Sniffer: responses per probe (1..=10000).
     #[clap(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..=10000))]
     count: u32,
-    #[clap(long, default_value = "0")]
+    /// Sniffer: delay in ms (0..=60000). Copy i (0-based) is sent at
+    /// (i+1)*delay after the probe was drained (the first copy is delayed
+    /// too). Delayed copies are queued, never blocking the ring drain.
+    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u64).range(0..=60000))]
     delay: u64,
+    /// Raw mode only: apply the valm/no-rsp(/icmp-error) decision in eBPF
+    /// and push only hits to the sniffer (misses dropped in-kernel,
+    /// suppressed hits counted in no_rsp_count). Requires --valm; not
+    /// allowed with --closed or --mode both.
+    #[clap(long)]
+    raw_filter: bool,
+    /// Sniffer: realistic SYN-ACK retransmits: linux|bsd|windows|internet.
+    /// TCP only: UDP/ICMP probes get a single immediate answer (use --count
+    /// for multiple UDP/ICMP answers). All copies of a probe are identical
+    /// (same ISN and source). First answer immediately (never lost),
+    /// retransmits at cumulative
+    /// offsets linux 1,3,7,15,31 s; bsd 3,9,21 s; windows 3,9 s; internet =
+    /// per-target-IP deterministic mix (31% linux, 42% bsd, 7% windows,
+    /// 4% linux up to 15 s, 16% single answer). Conflicts with --count > 1
+    /// and --delay > 0.
+    #[clap(long, value_parser = schedule::parse_rto_profile)]
+    rto_profile: Option<RtoProfile>,
+    /// Sniffer: loss probability in percent (0..=100, float, e.g. 3.3)
+    /// applied to each retransmit / delayed copy (never to the first
+    /// answer of --rto-profile, never to --delay 0 copies). Counted in
+    /// `lost`.
+    #[clap(long, default_value = "0", value_parser = schedule::parse_loss_perc)]
+    loss_perc: f64,
+    /// Sniffer: uniform extra delay [0, J] ms (0..=60000) added to each
+    /// retransmit / delayed copy (copies may reorder).
+    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u64).range(0..=60000))]
+    jitter_ms: u64,
+    /// Sniffer: capacity of the delayed-copy queue in jobs (>= 1). A full
+    /// queue drops the job and counts it in `pending_dropped`.
+    #[clap(long, default_value_t = schedule::DEFAULT_MAX_PENDING, value_parser = parse_max_pending)]
+    max_pending: usize,
+    /// Sniffer: seed for loss and jitter (default: random). Decisions are
+    /// derived per probe and copy from seed, target IP, ports, seq and copy
+    /// index, so they do not depend on the ring read order. The used seed
+    /// is printed at startup and reported as `seed` in the stats.
+    #[clap(long)]
+    seed: Option<u64>,
     #[clap(long)]
     fake_ip: Option<String>,
     #[clap(long, conflicts_with = "fake_ip")]
@@ -124,10 +178,22 @@ struct SnifferStatsJson {
     fake_sent: u64,
     frag_sent: u64,
     dropped_ring: u64,
+    answered_probes: u64,
+    pending_dropped: u64,
+    lost: u64,
+    send_failed: u64,
+    discarded_on_stop: u64,
+    seed: u64,
 }
 
-fn sniffer_stats_json(stats: &Option<Arc<SnifferStats>>) -> Option<SnifferStatsJson> {
+fn sniffer_stats_json(stats: &Option<Arc<SnifferStats>>, seed: u64) -> Option<SnifferStatsJson> {
     stats.as_ref().map(|s| SnifferStatsJson {
+        answered_probes: s.answered_probes.load(Ordering::Relaxed),
+        pending_dropped: s.pending_dropped.load(Ordering::Relaxed),
+        lost: s.lost.load(Ordering::Relaxed),
+        send_failed: s.send_failed.load(Ordering::Relaxed),
+        discarded_on_stop: s.discarded_on_stop.load(Ordering::Relaxed),
+        seed,
         sent: s.sent.load(Ordering::Relaxed),
         closed_sent: s.closed_sent.load(Ordering::Relaxed),
         fake_sent: s.fake_sent.load(Ordering::Relaxed),
@@ -145,6 +211,7 @@ async fn spawn_stats_poller(
     stats_file: String,
     mut stop_rx: watch::Receiver<bool>,
     final_slot: Arc<tokio::sync::Mutex<Option<AggregatedStats>>>,
+    sniffer_stats: Option<Arc<SnifferStats>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     use std::io::Write;
 
@@ -168,6 +235,17 @@ async fn spawn_stats_poller(
                 Ok(a) => a,
                 Err(_) => break,
             };
+            let (answered_probes, pending_dropped, send_failed, discarded_on_stop) = sniffer_stats
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.answered_probes.load(Ordering::Relaxed),
+                        s.pending_dropped.load(Ordering::Relaxed),
+                        s.send_failed.load(Ordering::Relaxed),
+                        s.discarded_on_stop.load(Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             let line = serde_json::json!({
                 "ts": start.elapsed().as_secs(),
                 "rx": agg.rx,
@@ -180,6 +258,10 @@ async fn spawn_stats_poller(
                 "icmp_tx": agg.icmp_tx,
                 "no_rsp_count": agg.no_rsp_count,
                 "ring_dropped": agg.ring_dropped,
+                "answered_probes": answered_probes,
+                "pending_dropped": pending_dropped,
+                "send_failed": send_failed,
+                "discarded_on_stop": discarded_on_stop,
             });
             let mut w = writer.lock().await;
             if writeln!(w, "{line}").is_err() || w.flush().is_err() {
@@ -252,6 +334,70 @@ async fn main() -> anyhow::Result<()> {
     ) {
         anyhow::bail!("invalid icmp-error type: {}", opt.icmp_error);
     }
+    schedule::validate_flags(&FlagCheck {
+        mode: &opt.mode,
+        valm: opt.valm,
+        closed: opt.closed,
+        raw_filter: opt.raw_filter,
+        count: opt.count,
+        delay_ms: opt.delay,
+        rto: opt.rto_profile.is_some(),
+    })
+    .map_err(|e| anyhow!(e))?;
+    if opt.raw_filter && opt.mode != "raw" {
+        eprintln!("WARN: --raw-filter only has an effect in --mode raw; ignored");
+    }
+    // Sniffer scheduling flags that have no effect in the current setup.
+    let mut sched_flags: Vec<&str> = Vec::new();
+    if opt.rto_profile.is_some() {
+        sched_flags.push("--rto-profile");
+    }
+    if opt.loss_perc > 0.0 {
+        sched_flags.push("--loss-perc");
+    }
+    if opt.jitter_ms > 0 {
+        sched_flags.push("--jitter-ms");
+    }
+    if opt.max_pending != schedule::DEFAULT_MAX_PENDING {
+        sched_flags.push("--max-pending");
+    }
+    if opt.seed.is_some() {
+        sched_flags.push("--seed");
+    }
+    let sched_ignored = opt.mode == "ebpf" || opt.closed;
+    if !sched_flags.is_empty() && opt.mode == "ebpf" {
+        eprintln!(
+            "WARN: {}: only used by the userspace sniffer (--mode raw|both); ignored in --mode ebpf",
+            sched_flags.join(", ")
+        );
+    } else if !sched_flags.is_empty() && opt.closed {
+        eprintln!(
+            "WARN: {}: no effect with --closed (one RST/ICMP-unreach per probe, no \
+             retransmits/loss/jitter/queue); ignored",
+            sched_flags.join(", ")
+        );
+    }
+    if !sched_ignored
+        && opt.rto_profile.is_some()
+        && matches!(opt.protocol.as_str(), "udp" | "icmp")
+    {
+        eprintln!(
+            "WARN: --rto-profile only applies to TCP; {} probes get a single answer \
+             (use --count for multiple answers)",
+            opt.protocol.to_uppercase()
+        );
+    }
+    if !sched_ignored
+        && (opt.loss_perc > 0.0 || opt.jitter_ms > 0)
+        && opt.rto_profile.is_none()
+        && opt.delay == 0
+    {
+        eprintln!(
+            "WARN: --loss-perc/--jitter-ms only apply to retransmits/delayed copies \
+             (--rto-profile or --delay > 0); no effect"
+        );
+    }
+    let seed = opt.seed.unwrap_or_else(schedule::random_seed);
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -295,12 +441,18 @@ async fn main() -> anyhow::Result<()> {
         no_rsp_perc,
         stats_file,
         json_stats,
+        raw_filter,
+        rto_profile,
+        loss_perc,
+        jitter_ms,
+        max_pending,
+        seed: _,
     } = opt;
 
     // Resolve numeric interface index to name (e.g. "5" → "eno1").
     // aya's attach() expects the interface name string, not an index.
     let iface = if let Ok(idx) = iface.parse::<u32>() {
-        match if_::if_indextoname(idx as u32) {
+        match if_::if_indextoname(idx) {
             Ok(name) => name.to_string_lossy().into_owned(),
             Err(_) => {
                 let mut msg = format!("unknown network interface index {idx}");
@@ -370,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
             icmp_error_type: icmp_error_code,
             no_rsp_perc,
             mgmt_ip: mgmt_ip.map(u32::from).unwrap_or(0),
+            raw_filter: raw_filter as u32,
         },
         0,
     )?;
@@ -442,9 +595,17 @@ async fn main() -> anyhow::Result<()> {
             None => Vec::new(),
         };
 
+        eprintln!("Sniffer seed: {seed}");
         let sniffer_config = SnifferConfig {
-            count,
-            delay,
+            schedule: ScheduleConfig {
+                count,
+                delay_ms: delay,
+                rto: rto_profile,
+                loss_perc,
+                jitter_ms,
+            },
+            max_pending,
+            seed,
             fake_ip: fake_ip_bytes,
             fake_ipv6,
             closed,
@@ -481,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
         stats_file.clone(),
         shutdown_rx.clone(),
         final_stats_slot.clone(),
+        sniffer_stats.clone(),
     )
     .await?;
     let ctrl_c = signal::ctrl_c();
@@ -529,7 +691,7 @@ async fn main() -> anyhow::Result<()> {
             "even_rx": stats.even_rx,
             "odd_rx": stats.odd_rx,
             "no_rsp_count": stats.no_rsp_count,
-            "sniffer": sniffer_stats_json(&sniffer_stats),
+            "sniffer": sniffer_stats_json(&sniffer_stats, seed),
         });
         println!("{final_stats}");
         return Ok(());
@@ -586,6 +748,27 @@ async fn main() -> anyhow::Result<()> {
             "Sniffer dropped_ring:         {}",
             sniffer_st.dropped_ring.load(Ordering::Relaxed)
         );
+        println!(
+            "Sniffer answered_probes:      {}",
+            sniffer_st.answered_probes.load(Ordering::Relaxed)
+        );
+        println!(
+            "Sniffer pending_dropped:      {}",
+            sniffer_st.pending_dropped.load(Ordering::Relaxed)
+        );
+        println!(
+            "Sniffer lost:                 {}",
+            sniffer_st.lost.load(Ordering::Relaxed)
+        );
+        println!(
+            "Sniffer send_failed:          {}",
+            sniffer_st.send_failed.load(Ordering::Relaxed)
+        );
+        println!(
+            "Sniffer discarded_on_stop:    {}",
+            sniffer_st.discarded_on_stop.load(Ordering::Relaxed)
+        );
+        println!("Sniffer seed:                 {seed}");
     }
     println!("=========================");
 

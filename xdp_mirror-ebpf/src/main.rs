@@ -94,11 +94,13 @@ const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_MSG_LEN: usize = 24;
 const ICMP_ERROR_V4_LEN: usize = 36; // 8 ICMP header + 20 orig IP + 8 orig UDP
 const ICMP_ERROR_V6_LEN: usize = 56; // 8 ICMPv6 header + 40 orig IPv6 + 8 orig UDP
-// Fixed reservation size per ring entry. aya's RingBuf verifier requires a
-// compile-time-constant size, so we reserve a fixed 1024 bytes for every
-// entry (header + optional UDP payload up to 944 bytes). TCP/ICMP entries
-// only use 80 bytes but still consume 1024 in the ring.
+// Ring reservation sizes. The verifier requires a compile-time-constant
+// reservation size, so UDP entries reserve a fixed 1024 bytes (header +
+// UDP payload up to 944 bytes), while TCP/ICMP entries reserve only the
+// 80-byte header (+ 8 B ring record header each), which fits ~12x more
+// TCP/ICMP probes into the 16 MiB ring.
 const PROBE_ENTRY_SIZE: usize = 1024;
+const PROBE_HDR_SIZE: usize = mem::size_of::<ProbeEventHeader>();
 
 enum Action {
     Mirror,
@@ -144,8 +146,9 @@ fn bump_rx_parity(dst_ip_even: bool) {
 
 /// Counts hits suppressed by `--no-rsp-perc` (a `NoResponse` decision = a hit
 /// that got silence instead of a reply). Only ever set by the eBPF program —
-/// the sniffer has no no-rsp logic — so the counter is valid in `ebpf` and
-/// `both` modes only (in `raw` mode everything goes to the RingBuf).
+/// the sniffer has no no-rsp logic — so the counter is valid in `ebpf`,
+/// `both` and filtered `raw` (`--raw-filter`) modes; in unfiltered `raw`
+/// mode everything goes to the RingBuf and it stays 0.
 #[inline(always)]
 fn bump_no_rsp() {
     if let Some(stats) = STATS.get_ptr_mut(0) {
@@ -153,10 +156,50 @@ fn bump_no_rsp() {
     }
 }
 
+/// Hit/miss decision shared by `ebpf` mode and filtered `raw` mode
+/// (`--raw-filter`). A hit becomes `Mirror` (in-kernel reply) or, when
+/// `push_hits` is set, `PushRing` (reply crafted by the userspace sniffer);
+/// `no_rsp` hits become `NoResponse`; UDP misses become `IcmpError` when an
+/// ICMP error type is configured, all other misses `Drop`.
+#[inline(always)]
+fn filtered_decision(
+    config: &Config,
+    dst_ip_even: bool,
+    no_rsp: bool,
+    is_udp: bool,
+    push_hits: bool,
+) -> Action {
+    let is_hit = if config.validation_mode != 0 {
+        dst_ip_even
+    } else {
+        let rnd = unsafe { bpf_get_prandom_u32() };
+        rnd % 100 < config.response_probability
+    };
+    if is_hit {
+        if no_rsp {
+            Action::NoResponse
+        } else if push_hits {
+            Action::PushRing
+        } else {
+            Action::Mirror
+        }
+    } else if is_udp && config.icmp_error_type != 0 {
+        Action::IcmpError
+    } else {
+        Action::Drop
+    }
+}
+
 #[inline(always)]
 fn decide(config: &Config, dst_ip_even: bool, no_rsp: bool, is_udp: bool) -> Action {
     let action = match config.mode {
-        1 => Action::PushRing,
+        1 => {
+            if config.raw_filter != 0 {
+                filtered_decision(config, dst_ip_even, no_rsp, is_udp, true)
+            } else {
+                Action::PushRing
+            }
+        }
         2 => {
             if dst_ip_even {
                 if no_rsp {
@@ -170,25 +213,7 @@ fn decide(config: &Config, dst_ip_even: bool, no_rsp: bool, is_udp: bool) -> Act
                 Action::PushRing
             }
         }
-        _ => {
-            let is_hit = if config.validation_mode != 0 {
-                dst_ip_even
-            } else {
-                let rnd = unsafe { bpf_get_prandom_u32() };
-                rnd % 100 < config.response_probability
-            };
-            if is_hit {
-                if no_rsp {
-                    Action::NoResponse
-                } else {
-                    Action::Mirror
-                }
-            } else if is_udp && config.icmp_error_type != 0 {
-                Action::IcmpError
-            } else {
-                Action::Drop
-            }
-        }
+        _ => filtered_decision(config, dst_ip_even, no_rsp, is_udp, false),
     };
     if matches!(action, Action::NoResponse) {
         bump_no_rsp();
@@ -445,7 +470,7 @@ fn handle_tcp_v4(
                 icmp_payload: [0; 16],
                 udp_payload_len: 0,
             };
-            Ok(push_probe_event(ctx, &hdr, 0, 0))
+            Ok(push_probe_header(&hdr))
         }
         Action::NoResponse => Ok(xdp_action::XDP_DROP),
         Action::IcmpError => Ok(xdp_action::XDP_DROP),
@@ -555,7 +580,7 @@ fn handle_tcp_v6(
                 icmp_payload: [0; 16],
                 udp_payload_len: 0,
             };
-            Ok(push_probe_event(ctx, &hdr, 0, 0))
+            Ok(push_probe_header(&hdr))
         }
         Action::NoResponse => Ok(xdp_action::XDP_DROP),
         Action::IcmpError => Ok(xdp_action::XDP_DROP),
@@ -837,7 +862,7 @@ fn handle_icmp_v4(
                 expand_v4(unsafe { (*ipv4_hdr).dst_addr }),
                 icmp_base,
             );
-            Ok(push_probe_event(ctx, &hdr, 0, 0))
+            Ok(push_probe_header(&hdr))
         }
         Action::NoResponse => Ok(xdp_action::XDP_DROP),
         Action::IcmpError => Ok(xdp_action::XDP_DROP),
@@ -914,7 +939,7 @@ fn handle_icmp_v6(
                 unsafe { (*ipv6_hdr).dst_addr },
                 icmp_base,
             );
-            Ok(push_probe_event(ctx, &hdr, 0, 0))
+            Ok(push_probe_header(&hdr))
         }
         Action::NoResponse => Ok(xdp_action::XDP_DROP),
         Action::IcmpError => Ok(xdp_action::XDP_DROP),
@@ -956,6 +981,29 @@ fn build_icmp_event(
     }
 }
 
+/// Pushes a header-only probe event (TCP/ICMP) to the `PROBES` ring,
+/// reserving exactly `size_of::<ProbeEventHeader>()` bytes. Always drops
+/// the frame (the sniffer answers it).
+#[inline(always)]
+fn push_probe_header(hdr: &ProbeEventHeader) -> u32 {
+    if let Some(mut entry) = PROBES.reserve::<[u8; PROBE_HDR_SIZE]>(0) {
+        let buf = entry.as_mut_ptr() as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hdr as *const ProbeEventHeader as *const u8,
+                buf,
+                PROBE_HDR_SIZE,
+            );
+        }
+        entry.submit(0);
+    } else if let Some(stats) = STATS.get_ptr_mut(0) {
+        unsafe { (*stats).ring_dropped += 1 };
+    }
+    xdp_action::XDP_DROP
+}
+
+/// Pushes a UDP probe event (header + up to 944 payload bytes) to the
+/// `PROBES` ring, reserving a fixed `PROBE_ENTRY_SIZE` bytes.
 #[inline(always)]
 fn push_probe_event(
     ctx: &XdpContext,

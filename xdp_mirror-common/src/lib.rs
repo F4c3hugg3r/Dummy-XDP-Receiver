@@ -24,6 +24,12 @@ pub struct Config {
     // never contain this IP (suite invariant: scan targets 10.0.0.0/12,
     // mgmt is the LAN IP of the receiver).
     pub mgmt_ip: u32,
+    // Raw-mode filter (`--raw-filter`): 0 = raw mode pushes every valid
+    // probe to the RingBuf (legacy); 1 = raw mode applies the same
+    // hit/no-rsp/icmp-error decision as ebpf mode and pushes only hits to
+    // the RingBuf (misses are dropped, no-rsp hits counted in
+    // `no_rsp_count`). Ignored in ebpf/both modes.
+    pub raw_filter: u32,
 }
 
 #[cfg(feature = "user")]
